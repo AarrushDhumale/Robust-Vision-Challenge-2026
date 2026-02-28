@@ -28,21 +28,37 @@ def set_seed(seed=42):
     torch.backends.cudnn.benchmark = False
 
 
-class GCELoss(nn.Module):
+class RobustComboLoss(nn.Module):
     """
-    Phase 1: Robust Training (Decontamination)
-    Generalized Cross Entropy Loss with Box-Cox transformation.
+    The Ultimate Phase 1 Loss: GCE + RCE
+    Combines the gradient throttling of GCE with the symmetric rejection of RCE.
     """
 
-    def __init__(self, q=0.7):
-        super(GCELoss, self).__init__()
-        self.q = q  # Hyperparameter set to 0.7 as per Trainsmart proposal
+    def __init__(self, alpha=1.0, beta=1.0, q=0.7, num_classes=10):
+        super(RobustComboLoss, self).__init__()
+        self.alpha = alpha
+        self.beta = beta
+        self.q = q
+        self.num_classes = num_classes
 
     def forward(self, logits, targets):
-        probs = F.softmax(logits, dim=1)
-        target_probs = torch.gather(probs, 1, targets.view(-1, 1)).squeeze(1)
-        loss = (1.0 - target_probs) ** self.q
-        return loss.mean()
+        # 1. Prediction Probabilities
+        pred_probs = F.softmax(logits, dim=1)
+        pred_probs_clamped = torch.clamp(pred_probs, min=1e-7, max=1.0)
+
+        # 2. GCE Term (The Shield)
+        target_probs = torch.gather(
+            pred_probs, 1, targets.view(-1, 1)).squeeze(1)
+        gce_loss = ((1.0 - target_probs) ** self.q).mean()
+
+        # 3. RCE Term (The Sword)
+        one_hot = F.one_hot(targets, num_classes=self.num_classes).float()
+        one_hot_clamped = torch.clamp(one_hot, min=1e-4, max=1.0)
+        rce_loss = (-1 * (pred_probs_clamped *
+                    torch.log(one_hot_clamped)).sum(dim=1)).mean()
+
+        # 4. Combine
+        return self.alpha * gce_loss + self.beta * rce_loss
 
 
 def load_pt_data(filepath):
