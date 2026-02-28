@@ -44,18 +44,18 @@ class RobustComboLoss(nn.Module):
     def forward(self, logits, targets):
         # 1. Prediction Probabilities
         pred_probs = F.softmax(logits, dim=1)
-        pred_probs_clamped = torch.clamp(pred_probs, min=1e-7, max=1.0)
+        pred_probs_clamped = torch.clamp(pred_probs, min=1e-4, max=1.0)
 
         # 2. GCE Term (The Shield)
         target_probs = torch.gather(
             pred_probs, 1, targets.view(-1, 1)).squeeze(1)
         gce_loss = ((1.0 - target_probs) ** self.q).mean()
 
-        # 3. RCE Term (The Sword)
+        # 3. RCE Term (The Sword) - CORRECTED MATH
         one_hot = F.one_hot(targets, num_classes=self.num_classes).float()
-        one_hot_clamped = torch.clamp(one_hot, min=1e-4, max=1.0)
-        rce_loss = (-1 * (pred_probs_clamped *
-                    torch.log(one_hot_clamped)).sum(dim=1)).mean()
+        # No clamping needed for one_hot anymore!
+        rce_loss = (-1 * (one_hot * torch.log(pred_probs_clamped)
+                          ).sum(dim=1)).mean()
 
         # 4. Combine
         return self.alpha * gce_loss + self.beta * rce_loss
@@ -109,14 +109,14 @@ def main():
 
     # 4. Initialize Model (Weights must be random, handled in RobustClassifier)
     model = RobustClassifier().to(device)
-    optimizer = optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
+    optimizer = optim.Adam(model.parameters(), lr=5e-4, weight_decay=1e-4)
 
     # 5. Define Losses based on the Trainsmart proposal
     cce_loss_fn = nn.CrossEntropyLoss()
     combo_loss_fn = RobustComboLoss(alpha=1.0, beta=1.0, q=0.7)
 
     epochs = 50
-    warmup_epochs = 5
+    warmup_epochs = 2
     best_val_acc = 0.0
     patience = 7
     patience_counter = 0
