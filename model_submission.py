@@ -26,7 +26,7 @@ class RobustClassifier(nn.Module):
         # ==========================================================
         # 0. THE MEMORY RESET (Crucial for 24-Scenario Independence)
         # ==========================================================
-        if self.pristine_state is not None:
+        if not self.training and self.pristine_state is not None:
             # We only restore the BN buffers (running mean/var) to prevent 
             # cross-scenario contamination, keeping it fast.
             for name, buffer in self.named_buffers():
