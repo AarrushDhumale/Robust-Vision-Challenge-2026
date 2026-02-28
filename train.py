@@ -97,8 +97,10 @@ def main():
 
     # 3. Load Datasets strictly from provided files
     print("Loading datasets...")
-    train_dataset = load_pt_data('source_toxic.pt')
-    val_dataset = load_pt_data('val_sanity.pt')
+    train_dataset = load_pt_data(
+        './data/hackenza-2026-test-time-adaptation-in-the-wild/source_toxic.pt')
+    val_dataset = load_pt_data(
+        './data/hackenza-2026-test-time-adaptation-in-the-wild/val_sanity.pt')
 
     # Apply transforms manually in a custom collate_fn or wrapper if needed,
     # but for TensorDatasets, we can apply them batch-wise in the loop.
