@@ -111,7 +111,7 @@ def main():
 
     # 5. Define Losses based on the Trainsmart proposal
     cce_loss_fn = nn.CrossEntropyLoss()
-    gce_loss_fn = GCELoss(q=0.7)
+    combo_loss_fn = RobustComboLoss(alpha=1.0, beta=1.0, q=0.7)
 
     epochs = 50
     warmup_epochs = 5
@@ -125,7 +125,7 @@ def main():
         running_loss = 0.0
 
         # 5-epoch CCE warm-up, then transition to custom GCE loss
-        current_loss_fn = cce_loss_fn if epoch < warmup_epochs else gce_loss_fn
+        current_loss_fn = cce_loss_fn if epoch < warmup_epochs else combo_loss_fn
 
         for images, labels in train_loader:
             images, labels = images.to(device), labels.to(device)
