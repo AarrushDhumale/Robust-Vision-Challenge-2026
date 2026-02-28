@@ -18,49 +18,80 @@ class RobustClassifier(nn.Module):
         num_ftrs = self.backbone.fc.in_features
         self.backbone.fc = nn.Linear(num_ftrs, 10)
         
-        self.pristine_state = None # To store clean weights
+        self.pristine_state = None
+
+    def _reset_model(self):
+        """Restores the Phase 1 weights before adapting to a new scenario."""
+        if self.pristine_state is not None:
+            self.load_state_dict(self.pristine_state)
 
     def forward(self, x):
         device = x.device
 
-        # ==========================================================
-        # 0. THE MEMORY RESET (Crucial for 24-Scenario Independence)
-        # ==========================================================
-        if not self.training and self.pristine_state is not None:
-            # We only restore the BN buffers (running mean/var) to prevent 
-            # cross-scenario contamination, keeping it fast.
-            for name, buffer in self.named_buffers():
-                if name in self.pristine_state:
-                    buffer.data.copy_(self.pristine_state[name].to(device))
+        if self.training:
+            return self.backbone(x)
 
         # ==========================================================
-        # PHASE 3: ALIGNMENT (BNStats + OOM Chunking)
+        # STEP 1: MEMORY WIPE
         # ==========================================================
-        if not self.training:
-            for module in self.modules():
-                if isinstance(module, nn.BatchNorm2d):
-                    # Force momentum to 1.0 so it ONLY uses the target batch stats,
-                    # completely ignoring the source training stats for adaptation.
-                    # module.momentum = 1.0 
-                    module.train()
+        self._reset_model()
 
-        batch_size = 256
-        all_logits = []
+        # ==========================================================
+        # STEP 2: ACTIVE ADAPTATION (TENT / ENTROPY MINIMIZATION)
+        # ==========================================================
+        params_to_adapt = []
+        for module in self.modules():
+            if isinstance(module, nn.BatchNorm2d):
+                module.train() 
+                module.weight.requires_grad_(True)
+                module.bias.requires_grad_(True)
+                params_to_adapt.extend([module.weight, module.bias])
+            else:
+                for param in module.parameters():
+                    param.requires_grad_(False)
 
+        # The internal optimizer for Test-Time Adaptation
+        optimizer = torch.optim.Adam(params_to_adapt, lr=1e-3)
+
+        batch_size = 128 
+        all_adapted_logits = []
+
+        # Adapt to the static chunk-by-chunk
         for i in range(0, x.size(0), batch_size):
             chunk = x[i:i+batch_size]
-            chunk_logits = self.backbone(chunk)
-            all_logits.append(chunk_logits)
+            
+            with torch.enable_grad():
+                optimizer.zero_grad()
+                logits = self.backbone(chunk)
+                
+                probs = F.softmax(logits, dim=1)
+                entropy = -torch.sum(probs * torch.log(probs + 1e-8), dim=1)
+                
+                # SAR Filter: Only learn from images where the model isn't completely blind
+                filter_mask = entropy < 2.0 
+                
+                if filter_mask.sum() > 0:
+                    loss = entropy[filter_mask].mean()
+                    loss.backward()
+                    optimizer.step()
+            
+            # Save the cleaned logits for this chunk
+            with torch.no_grad():
+                clean_logits = self.backbone(chunk)
+                all_adapted_logits.append(clean_logits)
 
-        base_logits = torch.cat(all_logits, dim=0)
+        # Reassemble the entire scenario dataset
+        base_logits = torch.cat(all_adapted_logits, dim=0)
 
         # ==========================================================
-        # PHASE 2: RECONNAISSANCE (Expectation-Maximization)
+        # STEP 3: RECONNAISSANCE (EXPECTATION-MAXIMIZATION)
         # ==========================================================
+        # Now that the logits are clean from static, EM can safely run
         num_classes = 10
         p_s = torch.ones(num_classes, device=device) / num_classes
         p_t = p_s.clone()
 
+        # Temperature softening keeps EM stable
         softened_logits = base_logits / 1.5
         base_probs = F.softmax(softened_logits, dim=1)
 
@@ -70,6 +101,7 @@ class RobustClassifier(nn.Module):
             adj_probs = adj_probs / (adj_probs.sum(dim=1, keepdim=True) + 1e-8)
             p_t = adj_probs.mean(dim=0)
 
+        # Apply the discovered label shift to the final logits
         log_adjustments = torch.log(p_t + 1e-8) - torch.log(p_s + 1e-8)
         final_logits = base_logits + log_adjustments
 
@@ -77,5 +109,4 @@ class RobustClassifier(nn.Module):
 
     def load_weights(self, path):
         self.load_state_dict(torch.load(path, map_location='cpu'))
-        # Save a pristine copy in memory immediately after loading
         self.pristine_state = copy.deepcopy(self.state_dict())
