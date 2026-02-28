@@ -42,23 +42,23 @@ class RobustComboLoss(nn.Module):
         self.num_classes = num_classes
 
     def forward(self, logits, targets):
-        # 1. Prediction Probabilities
-        pred_probs = F.softmax(logits, dim=1)
-        pred_probs_clamped = torch.clamp(pred_probs, min=1e-4, max=1.0)
+        p = F.softmax(logits, dim=1)
 
-        # 2. GCE Term (The Shield)
-        target_probs = torch.gather(
-            pred_probs, 1, targets.view(-1, 1)).squeeze(1)
-        gce_loss = ((1.0 - target_probs) ** self.q).mean()
+        # 1. GCE Term (The Shield) - Clips gradients of extreme outliers
+        p_true = torch.gather(p, 1, targets.view(-1, 1)).squeeze(1)
+        gce_loss = (1.0 - torch.clamp(p_true, 1e-7, 1.0)**self.q) / self.q
 
-        # 3. RCE Term (The Sword) - CORRECTED MATH
-        one_hot = F.one_hot(targets, num_classes=self.num_classes).float()
-        # No clamping needed for one_hot anymore!
-        rce_loss = (-1 * (one_hot * torch.log(pred_probs_clamped)
-                          ).sum(dim=1)).mean()
+        # 2. RCE Term (The Sword) - FIXED MATH
+        # Reverse Cross Entropy: -sum(pred * log(true))
+        pred_clamped = torch.clamp(p, 1e-7, 1.0)
+        label_oh = torch.clamp(
+            F.one_hot(targets, self.num_classes).float(), 1e-4, 1.0)
 
-        # 4. Combine
-        return self.alpha * gce_loss + self.beta * rce_loss
+        # This penalizes the model heavily if it confidently predicts a wrong label
+        rce_loss = -1 * torch.sum(pred_clamped * torch.log(label_oh), dim=1)
+
+        # 3. Combine with no standard CE backdoor
+        return self.alpha * gce_loss.mean() + self.beta * rce_loss.mean()
 
 
 def load_pt_data(filepath):
@@ -79,6 +79,32 @@ def load_pt_data(filepath):
         images = images.float() / 255.0
 
     return TensorDataset(images, labels)
+
+
+def generate_source_quantiles(model, dataloader, device, filepath='source_quantiles.pt'):
+    """
+    Extracts the 100 quantiles of the pristine feature distributions.
+    This gives model_submission.py the "golden reference" it needs for GQA.
+    """
+    print("Generating Grouped Quantile Alignment (GQA) references...")
+    model.eval()
+    all_logits = []
+
+    with torch.no_grad():
+        for images, _ in dataloader:
+            all_logits.append(model(images.to(device)))
+
+    base_logits = torch.cat(all_logits, dim=0)
+
+    # Calculate 100 quantiles (0th to 100th percentile) for all 10 classes
+    quantiles = torch.empty((100, 10), device=device)
+    q_steps = torch.linspace(0.0, 1.0, 100, device=device)
+
+    for c in range(10):
+        quantiles[:, c] = torch.quantile(base_logits[:, c], q_steps)
+
+    torch.save(quantiles.cpu(), filepath)
+    print(f"Successfully saved {filepath} for Test-Time Adaptation!")
 
 
 def main():
