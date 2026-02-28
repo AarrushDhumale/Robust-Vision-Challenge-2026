@@ -4,11 +4,12 @@ import torch.nn.functional as F
 from torchvision.models import resnet18
 import copy
 
+
 class RobustClassifier(nn.Module):
     def __init__(self):
         super().__init__()
         self.backbone = resnet18(weights=None)
-        
+
         # Modify input for 1-channel Fashion-MNIST [B, 1, 28, 28]
         self.backbone.conv1 = nn.Conv2d(
             1, 64, kernel_size=3, stride=1, padding=1, bias=False)
@@ -17,8 +18,8 @@ class RobustClassifier(nn.Module):
         # Modify the final FC layer for 10 classes
         num_ftrs = self.backbone.fc.in_features
         self.backbone.fc = nn.Linear(num_ftrs, 10)
-        
-        self.pristine_state = None # To store clean weights
+
+        self.pristine_state = None  # To store clean weights
 
     def forward(self, x):
         device = x.device
@@ -26,8 +27,8 @@ class RobustClassifier(nn.Module):
         # ==========================================================
         # 0. THE MEMORY RESET (Crucial for 24-Scenario Independence)
         # ==========================================================
-        if self.pristine_state is not None:
-            # We only restore the BN buffers (running mean/var) to prevent 
+        if not self.training and self.pristine_state is not None:
+            # We only restore the BN buffers (running mean/var) to prevent
             # cross-scenario contamination, keeping it fast.
             for name, buffer in self.named_buffers():
                 if name in self.pristine_state:
@@ -41,7 +42,7 @@ class RobustClassifier(nn.Module):
                 if isinstance(module, nn.BatchNorm2d):
                     # Force momentum to 1.0 so it ONLY uses the target batch stats,
                     # completely ignoring the source training stats for adaptation.
-                    # module.momentum = 1.0 
+                    # module.momentum = 1.0
                     module.train()
 
         batch_size = 256
@@ -76,6 +77,7 @@ class RobustClassifier(nn.Module):
         return final_logits
 
     def load_weights(self, path):
+        # Load the weights produced by your PureRobustLoss (96% target)
         self.load_state_dict(torch.load(path, map_location='cpu'))
-        # Save a pristine copy in memory immediately after loading
-        self.pristine_state = copy.deepcopy(self.state_dict())
+        # Capture the baseline buffers for the reset protocol
+        self.pristine_state = {n: b.clone() for n, b in self.named_buffers()}
