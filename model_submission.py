@@ -53,15 +53,21 @@ class RobustClassifier(nn.Module):
         # ==========================================================
         # PHASE 2: FEATURE EXTRACTION (OOM Chunking)
         # ==========================================================
-        batch_size = 256
-        all_logits = []
-
-        with torch.no_grad():  # Ensure zero VRAM bloat
-            for i in range(0, n_target, batch_size):
-                chunk = x[i:i+batch_size]
-                all_logits.append(self.backbone(chunk))
-
-        base_logits = torch.cat(all_logits, dim=0)
+        # ==========================================================
+        # PHASE 2: FEATURE EXTRACTION
+        # ==========================================================
+        if self.training:
+            # 1. Training Mode (train.py) - Keep gradients flowing!
+            base_logits = self.backbone(x)
+        else:
+            # 2. Test Mode (Kaggle submission) - OOM-safe chunking with no gradients
+            batch_size = 256
+            all_logits = []
+            with torch.no_grad():
+                for i in range(0, n_target, batch_size):
+                    chunk = x[i:i+batch_size]
+                    all_logits.append(self.backbone(chunk))
+            base_logits = torch.cat(all_logits, dim=0)
 
         # ==========================================================
         # PHASE 3: GROUPED QUANTILE ALIGNMENT (GQA)
