@@ -40,7 +40,7 @@ class RobustClassifier(nn.Module):
         for module in self.modules():
             if isinstance(module, nn.BatchNorm2d):
                 original_momentums[module] = module.momentum
-                module.momentum = 0.2  # Balanced adaptation
+                module.momentum = 0.5  # Balanced adaptation
 
         # Single recalibration pass
         self.train()
@@ -105,10 +105,10 @@ class RobustClassifier(nn.Module):
             # EM iterations
             for _ in range(10):
                 weighted = probs * (p_t / p_s)
-                weighted = weighted / (
-                    weighted.sum(dim=1, keepdim=True) + 1e-8
-                )
-                p_t = weighted.mean(dim=0)
+                weighted = weighted / (weighted.sum(dim=1, keepdim=True) + 1e-8)
+
+                new_estimate = weighted.mean(dim=0)
+                p_t = 0.8 * p_t + 0.2 * new_estimate
 
             # Logit prior correction
             log_adjust = torch.log(p_t + 1e-8) - torch.log(p_s + 1e-8)
