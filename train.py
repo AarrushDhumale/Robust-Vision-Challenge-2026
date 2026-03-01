@@ -226,6 +226,14 @@ def train(args):
             logits = model(imgs)
 
             # Warmup: CE on all samples; afterwards: GCE + small-loss filter
+            """
+            per_sample = ce(logits, lbls) if epoch <= args.warmup \
+                else gce(logits, lbls)
+
+            mask = small_loss_mask(per_sample.detach(), args.forget_rate,
+                                   epoch, args.warmup)
+            
+            """
             per_sample = ce(logits, lbls) if epoch <= args.warmup \
                 else gce(logits, lbls)
 
@@ -240,6 +248,7 @@ def train(args):
                                    current_forget,
                                    epoch,
                                    args.warmup)
+
             if mask.sum() == 0:
                 continue
 
