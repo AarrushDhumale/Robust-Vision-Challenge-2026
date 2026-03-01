@@ -28,17 +28,19 @@ class RobustComboLoss(nn.Module):
         self.num_classes = num_classes
 
     def forward(self, logits, targets):
+        # 1. Prediction Probabilities 
+        # (Clamped to absolutely prevent 0.0 or exactly 1.0)
         pred_probs = F.softmax(logits, dim=1)
+        pred_probs = torch.clamp(pred_probs, min=1e-7, max=1.0 - 1e-7)
         
-        # 1. GCE Term
+        # 2. True GCE Term: (1 - p^q) / q
         target_probs = torch.gather(pred_probs, 1, targets.view(-1, 1)).squeeze(1)
-        gce_loss = ((1.0 - (target_probs + 1e-8)) ** self.q).mean()
+        gce_loss = (1.0 - torch.pow(target_probs, self.q)) / self.q
+        gce_loss = gce_loss.mean()
 
-        # 2. RCE Term (CORRECTED)
+        # 3. RCE Term: - p * log(y)
         one_hot = F.one_hot(targets, num_classes=self.num_classes).float()
-        # Clamp the labels to avoid log(0) = -inf
         targets_clamped = torch.clamp(one_hot, min=1e-4, max=1.0)
-        # RCE Math: sum( predicted_probs * log(clamped_targets) )
         rce_loss = (-1 * (pred_probs * torch.log(targets_clamped)).sum(dim=1)).mean()
 
         return self.alpha * gce_loss + self.beta * rce_loss
@@ -75,6 +77,7 @@ def main():
     warmup_epochs = 2
     best_val_acc = 0.0
 
+    print("Running on branch - fresh")
     print("Starting Phase 1: Decontamination...")
     for epoch in range(epochs):
         model.train()
