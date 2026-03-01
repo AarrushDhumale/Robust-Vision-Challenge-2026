@@ -1,144 +1,295 @@
+"""
+train.py — Hackenza 2026 Robust Training
+==========================================
+Phase 1 only: train a robust classifier on source_toxic.pt.
+All TTA logic lives in model_submission.py::adapt().
+
+Algorithm:
+  - Warmup epochs : standard CE on all samples (model learns signal first)
+  - Main epochs   : GCE(q=0.7) + small-loss filter (discards noisiest 30%)
+  - Optimizer     : Adam + CosineAnnealingWarmRestarts
+  - Augmentation  : crop, flip, affine ONLY (no corruption augmentations)
+
+Usage:
+    python train.py \
+        --source source_toxic.pt \
+        --val    val_sanity.pt   \
+        --output weights.pth     \
+        [--epochs 100] [--batch_size 128] [--lr 3e-4]
+
+Compliance:
+  ✓ weights=None  (random init only)
+  ✓ No external data or pretrained weights
+  ✓ No corruption augmentations (AugMix / noise / blur all absent)
+  ✓ static.pt never touched during training
+"""
+
 import os
+import copy
 import random
+import argparse
+
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
-import torchvision.transforms as transforms
+import torchvision.transforms as T
+from torch.utils.data import DataLoader, Dataset
+
 from model_submission import RobustClassifier
 
-def set_seed(seed=42):
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 0.  Reproducibility
+# ─────────────────────────────────────────────────────────────────────────────
+
+def set_seed(seed: int = 42):
     random.seed(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-class RobustComboLoss(nn.Module):
-    def __init__(self, alpha=1.0, beta=0.1, q=0.7, num_classes=10):
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1.  Loss — GCE (per-sample, for small-loss filter compatibility)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class GCELoss(nn.Module):
+    """
+    Generalized Cross-Entropy (Zhang et al., NeurIPS 2018).
+    Returns per-sample losses so the small-loss filter can mask them.
+    q=0.7 is robust against symmetric noise up to ~50%.
+    """
+    def __init__(self, q: float = 0.7):
         super().__init__()
-        self.alpha = alpha
-        self.beta = beta
         self.q = q
-        self.num_classes = num_classes
 
-    def forward(self, logits, targets):
-        # 1. Prediction Probabilities (Clamped to prevent NaN)
-        pred_probs = F.softmax(logits, dim=1)
-        pred_probs = torch.clamp(pred_probs, min=1e-7, max=1.0 - 1e-7)
-        
-        # 2. GCE Term: (1 - p^q) / q
-        target_probs = torch.gather(pred_probs, 1, targets.view(-1, 1)).squeeze(1)
-        gce_loss = (1.0 - torch.pow(target_probs, self.q)) / self.q
-        gce_loss = gce_loss.mean()
+    def forward(self, logits: torch.Tensor,
+                targets: torch.Tensor) -> torch.Tensor:
+        probs = F.softmax(logits, dim=1)
+        p_y   = probs.gather(1, targets.view(-1, 1)).squeeze(1).clamp(min=1e-7)
+        return (1.0 - p_y ** self.q) / self.q   # [B], per-sample
 
-        # 3. RCE Term: - p * log(y)
-        one_hot = F.one_hot(targets, num_classes=self.num_classes).float()
-        targets_clamped = torch.clamp(one_hot, min=1e-4, max=1.0)
-        rce_loss = (-1 * (pred_probs * torch.log(targets_clamped)).sum(dim=1)).mean()
 
-        return self.alpha * gce_loss + self.beta * rce_loss
+# ─────────────────────────────────────────────────────────────────────────────
+# 2.  Small-loss filter
+# ─────────────────────────────────────────────────────────────────────────────
 
-def load_pt_data(filepath):
-    data = torch.load(filepath, map_location='cpu')
-    images, labels = data['images'], data['labels']
-    if images.dtype == torch.uint8:
-        images = images.float() / 255.0
-    return TensorDataset(images, labels)
+def small_loss_mask(losses: torch.Tensor,
+                    forget_rate: float,
+                    epoch: int,
+                    warmup: int) -> torch.Tensor:
+    """
+    Keep the (1 - forget_rate) fraction of samples with lowest loss.
+    All samples kept during warmup so the model first learns signal.
+    """
+    if epoch <= warmup:
+        return torch.ones(len(losses), dtype=torch.bool, device=losses.device)
+    n_keep = max(1, int(len(losses) * (1.0 - forget_rate)))
+    _, idx  = losses.topk(n_keep, largest=False, sorted=False)
+    mask    = torch.zeros(len(losses), dtype=torch.bool, device=losses.device)
+    mask[idx] = True
+    return mask
 
-def main():
-    set_seed(42)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Training on device: {device}")
-    
-    train_transform = transforms.Compose([
-        transforms.RandomCrop(28, padding=4),
-        transforms.RandomHorizontalFlip(),
-    ])
 
-    train_dataset = load_pt_data('./data/hackenza-2026-test-time-adaptation-in-the-wild/source_toxic.pt')
-    val_dataset = load_pt_data('./data/hackenza-2026-test-time-adaptation-in-the-wild/val_sanity.pt')
+# ─────────────────────────────────────────────────────────────────────────────
+# 3.  Data helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
-    train_loader = DataLoader(train_dataset, batch_size=128, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=128, shuffle=False)
+def load_tensors(path: str):
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Dataset not found: {path}")
+    raw  = torch.load(path, map_location="cpu")
+    imgs = raw["images"] if isinstance(raw, dict) else raw[0]
+    lbls = raw["labels"] if isinstance(raw, dict) else raw[1]
+    imgs = imgs.float()
+    if imgs.max() > 1.5:
+        imgs = imgs / 255.0
+    return imgs, lbls.long()
 
-    model = RobustClassifier().to(device)
-    optimizer = optim.Adam(model.parameters(), lr=5e-4, weight_decay=1e-4)
 
-    cce_loss_fn = nn.CrossEntropyLoss()
-    combo_loss_fn = RobustComboLoss(alpha=1.0, beta=0.1, q=0.7)
+# Permitted augmentations — geometric / occlusion only, NO corruption
+TRAIN_AUG = T.Compose([
+    T.RandomCrop(28, padding=4),
+    T.RandomHorizontalFlip(p=0.5),
+    T.RandomAffine(degrees=10, translate=(0.1, 0.1), scale=(0.9, 1.1)),
+])
 
-    # --- Training Hyperparameters ---
-    epochs = 50
-    warmup_epochs = 2
-    
-    # --- Tracking & Early Stopping Variables ---
+
+class AugDataset(Dataset):
+    """
+    Applies augmentation per sample inside DataLoader workers —
+    fast, parallel, no Python loop bottleneck in the training loop.
+    Set transform=None for the val set.
+    """
+    def __init__(self, images, labels, transform=None):
+        self.images    = images
+        self.labels    = labels
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, idx):
+        img = self.images[idx]
+        if self.transform is not None:
+            img = self.transform(img)
+        return img, self.labels[idx]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4.  Evaluation
+# ─────────────────────────────────────────────────────────────────────────────
+
+@torch.no_grad()
+def evaluate(model: nn.Module,
+             loader: DataLoader,
+             device: torch.device) -> float:
+    model.eval()
+    correct = total = 0
+    for imgs, lbls in loader:
+        preds = model(imgs.to(device)).argmax(1)
+        correct += (preds == lbls.to(device)).sum().item()
+        total   += len(lbls)
+    return correct / total
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5.  Training loop
+# ─────────────────────────────────────────────────────────────────────────────
+
+def train(args):
+    set_seed(args.seed)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    print('=' * 60)
+    print('Hackenza 2026 — Phase 1: Robust Training')
+    print('=' * 60)
+    print(f'  Device      : {device}')
+    print(f'  Epochs      : {args.epochs}')
+    print(f'  Batch size  : {args.batch_size}')
+    print(f'  LR          : {args.lr}')
+    print(f'  GCE q       : {args.gce_q}')
+    print(f'  Forget rate : {args.forget_rate}  (matches noise rate)')
+    print(f'  Warmup      : {args.warmup} epochs')
+    print(f'  Patience    : {args.patience} epochs')
+
+    # ── Data ──────────────────────────────────────────────────────────────────────
+    print('\n[DATA] Loading...')
+    train_imgs, train_lbls = load_tensors(args.source)
+    val_imgs,   val_lbls   = load_tensors(args.val)
+
+    # Augmentation runs inside DataLoader workers - fast and parallel
+    train_ds = AugDataset(train_imgs, train_lbls, transform=TRAIN_AUG)
+    val_ds   = AugDataset(val_imgs,   val_lbls,   transform=None)
+
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size,
+                              shuffle=True, num_workers=4, pin_memory=True,
+                              drop_last=True, persistent_workers=True)
+    val_loader   = DataLoader(val_ds, batch_size=256,
+                              shuffle=False, num_workers=2, pin_memory=True)
+    print(f'  Train: {len(train_ds):,} samples  |  Val: {len(val_ds)} samples')
+    # ── Model ──────────────────────────────────────────────────────────────
+    model = RobustClassifier(num_classes=10).to(device)
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f'\n[MODEL] Parameters: {n_params:,}')
+
+    # ── Loss & optimizer ───────────────────────────────────────────────────
+    gce = GCELoss(q=args.gce_q)
+    ce  = nn.CrossEntropyLoss(reduction='none')  # warmup
+
+    optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer, T_0=30, T_mult=2, eta_min=1e-6
+    )
+
+    # ── Loop ───────────────────────────────────────────────────────────────
     best_val_acc = 0.0
-    best_epoch = 0
-    patience = 7
-    patience_counter = 0
+    best_state   = None
+    no_improve   = 0
 
-    print("Running on branch - fresh")
-    print("Starting Phase 1: Decontamination...")
-    for epoch in range(epochs):
+    print('\n[TRAIN] Starting…\n')
+    for epoch in range(1, args.epochs + 1):
         model.train()
-        running_loss = 0.0
-        
-        # Switch from CCE Warmup to RobustComboLoss at epoch 3
-        current_loss_fn = cce_loss_fn if epoch < warmup_epochs else combo_loss_fn
+        epoch_loss = correct = total = 0
 
-        for images, labels in train_loader:
-            images, labels = images.to(device), labels.to(device)
-            augmented_images = torch.stack([train_transform(img) for img in images])
+        for imgs, lbls in train_loader:
+            imgs = imgs.to(device)
+            lbls = lbls.to(device)
 
+            logits = model(imgs)
+
+            # Warmup: CE on all samples; afterwards: GCE + small-loss filter
+            per_sample = ce(logits, lbls) if epoch <= args.warmup \
+                         else gce(logits, lbls)
+
+            mask = small_loss_mask(per_sample.detach(), args.forget_rate,
+                                   epoch, args.warmup)
+            if mask.sum() == 0:
+                continue
+
+            loss = per_sample[mask].mean()
             optimizer.zero_grad()
-            logits = model(augmented_images)
-            loss = current_loss_fn(logits, labels)
-
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
             optimizer.step()
-            running_loss += loss.item()
 
-        # --- Validation on Clean Data ---
-        model.eval()
-        correct = 0
-        with torch.no_grad():
-            for images, labels in val_loader:
-                images, labels = images.to(device), labels.to(device)
-                logits = model(images)
-                correct += (logits.argmax(1) == labels).sum().item()
+            epoch_loss += loss.item()
+            correct    += (logits.detach().argmax(1) == lbls).sum().item()
+            total      += len(lbls)
 
-        val_acc = 100 * correct / len(val_dataset)
-        print(f"Epoch {epoch+1:02d}/{epochs} | Loss: {running_loss/len(train_loader):.4f} | Val Acc: {val_acc:.2f}%")
+        scheduler.step()
 
-        # --- Early Stopping & Checkpoint Logic ---
+        val_acc   = evaluate(model, val_loader, device)
+        train_acc = correct / max(total, 1)
+        lr_now    = scheduler.get_last_lr()[0]
+        tag       = '  ← WARMUP' if epoch <= args.warmup else ''
+
+        print(f'Epoch {epoch:3d}/{args.epochs} | '
+              f'Loss {epoch_loss/len(train_loader):.4f} | '
+              f'Train {train_acc*100:5.2f}% | '
+              f'Val {val_acc*100:5.2f}% | '
+              f'LR {lr_now:.1e}{tag}')
+
         if val_acc > best_val_acc:
             best_val_acc = val_acc
-            best_epoch = epoch + 1
-            patience_counter = 0
-            
-            # Lock in the weights
-            torch.save(model.state_dict(), 'weights.pth')
+            best_state   = copy.deepcopy(model.state_dict())
+            torch.save(best_state, args.output)
+            no_improve   = 0
+            print(f'         ✓ Best val acc {best_val_acc*100:.2f}% → {args.output}')
         else:
-            patience_counter += 1
-            
-            # Only trigger a cutoff AFTER the warmup phase is done
-            if patience_counter >= patience and epoch >= warmup_epochs:
-                print(f"\n[EARLY STOPPING] Triggered at epoch {epoch+1} due to {patience} consecutive epochs without improvement.")
+            no_improve += 1
+            if no_improve >= args.patience and epoch > args.warmup:
+                print(f'\nEarly stop: no improvement for {args.patience} epochs.')
                 break
 
-    # --- Final Output Summary ---
-    print("\n" + "="*50)
-    print("="*50)
-    print(f"Best Epoch     : {best_epoch}")
-    print(f"Best Val Acc   : {best_val_acc:.2f}%")
-    print("Saved Weights  : 'weights.pth' has been successfully locked to this epoch.")
-    print("="*50)
+    # ── Restore best weights ───────────────────────────────────────────────
+    if best_state:
+        model.load_state_dict(best_state)
+    torch.save(model.state_dict(), args.output)
+    print(f'\n[DONE] Best val acc : {best_val_acc*100:.2f}%')
+    print(f'[DONE] Weights      : {args.output}')
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6.  CLI
+# ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
-    main()
+    p = argparse.ArgumentParser()
+    p.add_argument('--source',      default='./data/hackenza-2026-test-time-adaptation-in-the-wild/source_toxic.pt')
+    p.add_argument('--val',         default='./data/hackenza-2026-test-time-adaptation-in-the-wild/val_sanity.pt')
+    p.add_argument('--output',      default='weights.pth')
+    p.add_argument('--epochs',      type=int,   default=100)
+    p.add_argument('--batch_size',  type=int,   default=128)
+    p.add_argument('--lr',          type=float, default=3e-4)
+    p.add_argument('--gce_q',       type=float, default=0.7)
+    p.add_argument('--forget_rate', type=float, default=0.30)
+    p.add_argument('--warmup',      type=int,   default=10)
+    p.add_argument('--patience',    type=int,   default=20)
+    p.add_argument('--seed',        type=int,   default=42)
+    train(p.parse_args())
