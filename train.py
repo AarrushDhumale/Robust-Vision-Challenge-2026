@@ -65,7 +65,7 @@ class GCELoss(nn.Module):
     q=0.7 is robust against symmetric noise up to ~50%.
     """
 
-    def __init__(self, q: float = 0.65):
+    def __init__(self, q: float = 0.7):
         super().__init__()
         self.q = q
 
