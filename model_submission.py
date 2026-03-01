@@ -11,7 +11,6 @@ class RobustClassifier(nn.Module):
 
         self.backbone = resnet18(weights=None)
 
-        # Modify input for 1-channel Fashion-MNIST
         self.backbone.conv1 = nn.Conv2d(
             1, 64, kernel_size=3, stride=1, padding=1, bias=False
         )
@@ -20,56 +19,48 @@ class RobustClassifier(nn.Module):
         num_ftrs = self.backbone.fc.in_features
         self.backbone.fc = nn.Linear(num_ftrs, 10)
 
-        self.pristine_state = None  # for resetting BN buffers
+        self.pristine_state = None
 
     def forward(self, x):
         device = x.device
         n = x.size(0)
 
-        # ==========================================================
-        # 1. MEMORY RESET (Prevent cross-scenario contamination)
-        # ==========================================================
+        # Reset BN buffers
         if self.pristine_state is not None:
             for name, buffer in self.named_buffers():
                 if name in self.pristine_state:
                     buffer.data.copy_(self.pristine_state[name].to(device))
 
-        # ==========================================================
-        # 2. BN RE-CALIBRATION (Covariate Shift Handling)
-        # ==========================================================
+        # BN recalibration
         if not self.training and n >= 64:
             for module in self.modules():
                 if isinstance(module, nn.BatchNorm2d):
                     module.train()
-                    module.momentum = 0.5  # aggressive but stable
+                    module.momentum = 0.5
 
         logits = self.backbone(x)
 
-        # ==========================================================
-        # 3. EM LABEL SHIFT CORRECTION (No Damping)
-        # ==========================================================
+        # EM label shift correction
         if not self.training and n >= 16:
             num_classes = logits.size(1)
-
             p_s = torch.ones(num_classes, device=device) / num_classes
             p_t = p_s.clone()
 
-            probs = F.softmax(logits / 1.5, dim=1)
+            probs = F.softmax(logits / 1.3, dim=1)  # slightly sharper
 
             for _ in range(10):
                 weighted = probs * (p_t / p_s)
-                weighted = weighted / (
-                    weighted.sum(dim=1, keepdim=True) + 1e-8
-                )
-
+                weighted = weighted / (weighted.sum(dim=1, keepdim=True) + 1e-8)
                 new_estimate = weighted.mean(dim=0)
-                p_t = 0.8 * p_t + 0.2 * new_estimate
 
-                log_adjustment = torch.log(p_t + 1e-8) - torch.log(p_s + 1e-8)
-                logits = logits + log_adjustment
+                # EM damping
+                p_t = 0.6 * p_t + 0.4 * new_estimate
 
-            return logits
+            log_adjustment = torch.log(p_t + 1e-8) - torch.log(p_s + 1e-8)
+            logits = logits + log_adjustment
+
+        return logits
 
     def load_weights(self, path):
-        self.load_state_dict(torch.load(path, map_location='cpu'))
+        self.load_state_dict(torch.load(path, map_location="cpu"))
         self.pristine_state = copy.deepcopy(self.state_dict())
