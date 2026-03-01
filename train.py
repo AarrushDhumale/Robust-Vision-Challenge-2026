@@ -124,10 +124,8 @@ def main():
             
             # Lock in the weights
             torch.save(model.state_dict(), 'weights.pth')
-            print(f"  --> Model improved! Weights saved. (Best Acc: {best_val_acc:.2f}%)")
         else:
             patience_counter += 1
-            print(f"  --> No improvement. Patience: {patience_counter}/{patience}")
             
             # Only trigger a cutoff AFTER the warmup phase is done
             if patience_counter >= patience and epoch >= warmup_epochs:
@@ -136,11 +134,10 @@ def main():
 
     # --- Final Output Summary ---
     print("\n" + "="*50)
-    print("🚀 TRAINING COMPLETE: PHASE 1 SUMMARY")
     print("="*50)
     print(f"Best Epoch     : {best_epoch}")
     print(f"Best Val Acc   : {best_val_acc:.2f}%")
-    print("Saved Weights  : 'weights.pth' has been successfully locked to this exact epoch.")
+    print("Saved Weights  : 'weights.pth' has been successfully locked to this epoch.")
     print("="*50)
 
 if __name__ == '__main__':
