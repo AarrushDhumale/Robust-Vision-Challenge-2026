@@ -7,67 +7,44 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 import torchvision.transforms as transforms
-import copy
 
-# Import your custom architecture from the required Kaggle submission format
 from model_submission import RobustClassifier
 
 
 def set_seed(seed=42):
-    """
-    STRICT REPRODUCIBILITY: Locks all random number generators to ensure 
-    the judges get the exact same weights.pth when they run this script.
-    """
     random.seed(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
 
-class RobustComboLoss(nn.Module):
-    """
-    The Ultimate Phase 1 Loss: GCE + RCE
-    Combines the gradient throttling of GCE with the symmetric rejection of RCE.
-    """
-
-    def __init__(self, alpha=1.0, beta=1.0, q=0.7, num_classes=10):
-        super(RobustComboLoss, self).__init__()
-        self.alpha = alpha
-        self.beta = beta
+# ==========================================================
+# PURE GENERALIZED CROSS ENTROPY (GCE)
+# ==========================================================
+class GCELoss(nn.Module):
+    def __init__(self, q=0.7):
+        super(GCELoss, self).__init__()
         self.q = q
-        self.num_classes = num_classes
 
     def forward(self, logits, targets):
-        p = F.softmax(logits, dim=1)
+        probs = F.softmax(logits, dim=1)
+        p_true = torch.gather(probs, 1, targets.view(-1, 1)).squeeze(1)
+        p_true = torch.clamp(p_true, 1e-7, 1.0)
 
-        # 1. GCE Term (The Shield) - Clips gradients of extreme outliers
-        p_true = torch.gather(p, 1, targets.view(-1, 1)).squeeze(1)
-        gce_loss = (1.0 - torch.clamp(p_true, 1e-7, 1.0)**self.q) / self.q
+        if self.q == 0:
+            loss = -torch.log(p_true)
+        else:
+            loss = (1 - p_true.pow(self.q)) / self.q
 
-        # 2. RCE Term (The Sword) - FIXED MATH
-        # Reverse Cross Entropy: -sum(pred * log(true))
-        pred_clamped = torch.clamp(p, 1e-7, 1.0)
-        label_oh = torch.clamp(
-            F.one_hot(targets, self.num_classes).float(), 1e-4, 1.0)
-
-        # This penalizes the model heavily if it confidently predicts a wrong label
-        rce_loss = -1 * torch.sum(pred_clamped * torch.log(label_oh), dim=1)
-
-        # 3. Combine with no standard CE backdoor
-        return self.alpha * gce_loss.mean() + self.beta * rce_loss.mean()
+        return loss.mean()
 
 
 def load_pt_data(filepath):
-    """
-    STRICT COMPLIANCE: Loads data strictly from local .pt files.
-    No external data downloaded (e.g., standard Fashion-MNIST).
-    """
     if not os.path.exists(filepath):
-        raise FileNotFoundError(f"Missing required dataset: {filepath}")
+        raise FileNotFoundError(f"Missing dataset: {filepath}")
 
     data = torch.load(filepath)
     if isinstance(data, dict):
@@ -81,113 +58,87 @@ def load_pt_data(filepath):
     return TensorDataset(images, labels)
 
 
-def generate_source_quantiles(model, dataloader, device, filepath='source_quantiles.pt'):
-    """
-    Extracts the 100 quantiles of the pristine feature distributions.
-    This gives model_submission.py the "golden reference" it needs for GQA.
-    """
-    print("Generating Grouped Quantile Alignment (GQA) references...")
-    model.eval()
-    all_logits = []
-
-    with torch.no_grad():
-        for images, _ in dataloader:
-            all_logits.append(model(images.to(device)))
-
-    base_logits = torch.cat(all_logits, dim=0)
-
-    # Calculate 100 quantiles (0th to 100th percentile) for all 10 classes
-    quantiles = torch.empty((100, 10), device=device)
-    q_steps = torch.linspace(0.0, 1.0, 100, device=device)
-
-    for c in range(10):
-        quantiles[:, c] = torch.quantile(base_logits[:, c], q_steps)
-
-    torch.save(quantiles.cpu(), filepath)
-    print(f"Successfully saved {filepath} for Test-Time Adaptation!")
-
-
 def main():
-    # 1. Lock seeds for 50% Reproducibility score
     set_seed(42)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Training on device: {device}")
+    print(f"Training on {device}")
 
-    # 2. Strict Augmentation Whitelist (No AugMix, PixMix, or AutoAugment)
+    # Whitelisted augmentations only
     train_transform = transforms.Compose([
         transforms.RandomCrop(28, padding=4),
         transforms.RandomHorizontalFlip(),
-        # No corruption-based augmentations applied here to avoid penalty.
     ])
 
-    # 3. Load Datasets strictly from provided files
     print("Loading datasets...")
     train_dataset = load_pt_data(
         './data/hackenza-2026-test-time-adaptation-in-the-wild/source_toxic.pt')
     val_dataset = load_pt_data(
         './data/hackenza-2026-test-time-adaptation-in-the-wild/val_sanity.pt')
 
-    # Apply transforms manually in a custom collate_fn or wrapper if needed,
-    # but for TensorDatasets, we can apply them batch-wise in the loop.
     train_loader = DataLoader(train_dataset, batch_size=128, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=128, shuffle=False)
 
-    # 4. Initialize Model (Weights must be random, handled in RobustClassifier)
     model = RobustClassifier().to(device)
-    optimizer = optim.Adam(model.parameters(), lr=5e-4, weight_decay=1e-4)
 
-    # 5. Define Losses based on the Trainsmart proposal
-    cce_loss_fn = nn.CrossEntropyLoss()
-    combo_loss_fn = RobustComboLoss(alpha=1.0, beta=1.0, q=0.7)
+    # Slightly lower LR for stability under noise
+    optimizer = optim.Adam(model.parameters(), lr=3e-4, weight_decay=1e-4)
+
+    ce_loss = nn.CrossEntropyLoss()
+    gce_loss = GCELoss(q=0.7)
 
     epochs = 50
-    warmup_epochs = 2
+    warmup_epochs = 5
     best_val_acc = 0.0
     patience = 7
     patience_counter = 0
 
-    print("Starting Phase 1: Decontamination...")
+    print("Starting training...")
+
     for epoch in range(epochs):
         model.train()
         running_loss = 0.0
 
-        # 5-epoch CCE warm-up, then transition to custom GCE loss
-        current_loss_fn = cce_loss_fn if epoch < warmup_epochs else combo_loss_fn
+        current_loss = ce_loss if epoch < warmup_epochs else gce_loss
 
         for images, labels in train_loader:
+            images = torch.stack([train_transform(img) for img in images])
             images, labels = images.to(device), labels.to(device)
 
-            # Apply whitelist augmentations batch-wise
-            augmented_images = torch.stack(
-                [train_transform(img) for img in images])
-
             optimizer.zero_grad()
-            logits = model(augmented_images)
-            loss = current_loss_fn(logits, labels)
+            logits = model(images)
+            loss = current_loss(logits, labels)
 
             loss.backward()
+
+            # Gradient clipping for extra stability
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+
             optimizer.step()
             running_loss += loss.item()
 
-        # Validation on val_sanity.pt
+        # Validation
         model.eval()
         correct = 0
         total = 0
+
         with torch.no_grad():
             for images, labels in val_loader:
                 images, labels = images.to(device), labels.to(device)
                 logits = model(images)
-                _, predicted = torch.max(logits.data, 1)
+                preds = torch.argmax(logits, dim=1)
                 total += labels.size(0)
-                correct += (predicted == labels).sum().item()
+                correct += (preds == labels).sum().item()
 
         val_acc = 100 * correct / total
 
         print(
-            f"Epoch {epoch+1}/{epochs} | Loss: {running_loss/len(train_loader):.4f} | Val Acc: {val_acc:.2f}%")
+            f"Epoch {epoch+1}/{epochs} | "
+            f"Loss: {running_loss/len(train_loader):.4f} | "
+            f"Val Acc: {val_acc:.2f}%"
+        )
 
-        # Save weights.pth strictly
+        # Early stopping
         if val_acc > best_val_acc:
             best_val_acc = val_acc
             torch.save(model.state_dict(), 'weights.pth')
@@ -198,8 +149,7 @@ def main():
                 print("Early stopping triggered.")
                 break
 
-    print(
-        f"Training complete. Weights saved to weights.pth. Best Val Acc: {best_val_acc:.2f}%")
+    print(f"Training complete. Best Val Acc: {best_val_acc:.2f}%")
 
 
 if __name__ == '__main__':
