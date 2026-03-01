@@ -1,7 +1,6 @@
-# Robust-Vision-Challenge-2026
 # Hackenza 2026: Test-Time Adaptation in the Wild
 
-A robust vision classifier that survives noisy training data and adapts itself — without labels — to hostile target domains at inference time.
+A robust vision classifier that survives poisoned training data and automatically self-adapts — without labels — to hostile target domains at inference time.
 
 ---
 
@@ -21,108 +20,129 @@ A robust vision classifier that survives noisy training data and adapts itself �
 
 ## Problem Overview
 
-The challenge simulates a robot deployed in a hostile environment where:
+The challenge simulates a robot deployed in a hostile environment where three compounding problems must be solved simultaneously:
 
-1. **Toxicity** — Training data (`source_toxic.pt`) contains **30% label noise**, meaning roughly 1 in 3 labels is intentionally wrong.
-2. **Blind Adaptation** — The target domain (`static.pt`) has **no labels**, suffers from significant sensor noise, and exhibits heavy **class imbalance**.
+1. **Toxicity** — Training data (`source_toxic.pt`) contains **30% label noise**, meaning roughly 1 in 3 labels is intentionally wrong. Standard cross-entropy will memorise the noise and produce an overconfident, brittle classifier.
+
+2. **Blind Adaptation** — The target domain (`static.pt`) has **no labels**, suffers from significant sensor noise (covariate shift), and exhibits heavy **class imbalance** (label shift). The model must correct for both without any supervision.
+
 3. **Stress Test** — The final model is evaluated across **24 hidden corruption scenarios** at multiple severity levels, requiring genuine generalisation rather than overfitting to a single distribution.
 
-The evaluation metrics are **Robust Accuracy**, **Macro-F1** (critical due to class imbalance), and a weighted **Robustness Score** that penalises failures at high severity.
+The evaluation metrics are **Robust Accuracy**, **Macro-F1** (critical due to class imbalance — solutions that over-predict majority classes will be penalised), and a weighted **Robustness Score** that penalises failures at high severity.
 
 ---
 
 ## Solution Architecture
 
-The solution is split cleanly across two files:
+The solution is split across three files with a clean separation of responsibilities:
 
 | File | Responsibility |
 |---|---|
 | `train.py` | Phase 1: robust training on noisy source data |
-| `model_submission.py` | Architecture + self-contained Test-Time Adaptation (TTA) |
+| `model_submission.py` | Model architecture + self-contained Test-Time Adaptation (TTA) |
+| `generate_submission.py` | Thin submission generator that orchestrates per-domain adaptation |
 
-### Model
+### Model Backbone
 
 The backbone is a **ResNet-18** modified for 28×28 greyscale images:
 
-- `conv1` replaced with a 3×3 convolution accepting 1 input channel (greyscale).
-- `maxpool` replaced with `nn.Identity()` to preserve spatial resolution at 28×28.
-- Final `fc` layer outputs 10 class logits.
+- `conv1` replaced with a 3×3 convolution accepting **1 input channel** (greyscale, no RGB).
+- `maxpool` replaced with `nn.Identity()` to **preserve spatial resolution** at 28×28 — the standard ResNet maxpool would aggressively downsample these small images.
+- Final `fc` layer outputs **10 class logits**.
 - All weights are **randomly initialised via Kaiming Normal** — no pretrained weights, as required by competition rules.
+- ResNet-18's residual connections provide stable gradient flow during noisy training, where plain deep networks would have their gradients dominated by high-loss noisy samples.
 
 ---
 
 ## Core Logic
 
-The solution addresses the three challenge phases with distinct, principled techniques.
+The solution addresses each challenge phase with a distinct, principled technique.
 
-### Phase 1 — Surviving Toxicity (train.py)
+### Phase 1 — Surviving Toxicity (`train.py`)
 
 **Problem:** 30% of training labels are wrong. Standard cross-entropy will memorise the noise.
 
-**Solution: Generalised Cross-Entropy (GCE) + Small-Loss Filtering**
+**Solution: Two-stage approach — warmup then GCE + small-loss filtering**
 
-- **Warmup phase (epochs 1–10):** Standard cross-entropy loss is used on *all* samples. The model first learns the strong signal before noise filtering begins. Filtering too early risks discarding clean samples.
-- **Main phase (epoch 11+):** GCE loss (`q=0.7`) is used, which is theoretically robust to symmetric noise up to ~50%. Loss is computed *per sample*.
-- **Small-loss filter:** After computing per-sample GCE losses, only the **lowest-loss 70% of samples** in each batch are used for the gradient update. The noisiest 30% (matching the known noise rate) are silently discarded. The intuition is that noisy samples have higher loss because the model's prediction disagrees with the (wrong) label.
+**Stage 1 — Warmup (epochs 1–10):** Standard `CrossEntropyLoss` is applied on *all* samples with no filtering. The model first learns the genuine signal present in the 70% clean labels before any sample rejection begins. Starting the filter too early risks mistakenly discarding clean samples whose loss happens to be high at initialisation.
 
-**Optimiser & Scheduler:**
+**Stage 2 — Main training (epoch 11+):** Two mechanisms work in tandem:
 
-- Adam with weight decay `1e-4`.
-- `CosineAnnealingWarmRestarts` (`T_0=30, T_mult=2`) provides periodic learning rate resets, helping the model escape local minima caused by noisy gradients.
-- Gradient clipping at norm 5.0 prevents exploding gradients.
+- **Generalised Cross-Entropy (GCE, Zhang et al. NeurIPS 2018):** Replaces standard CE with a noise-robust loss. At `q=0.7`, GCE is theoretically robust to symmetric label noise up to ~50% — well above the 30% noise rate in this challenge. Unlike CE, GCE naturally down-weights the gradient contribution of confidently wrong predictions. Loss is computed *per sample* to enable the filter below.
 
-**Augmentation (permitted only):**
+- **Small-loss filter:** Within each batch, per-sample GCE losses are computed and only the **lowest-loss 70% of samples** are used for the gradient update. The noisiest 30% (matching the known noise rate) are silently discarded. The intuition is clean: a correctly labelled sample will tend to have a lower loss because the model's prediction aligns with the label, while a mislabelled sample forces the model to predict something it has learned is unlikely, producing a higher loss.
+
+**Optimiser and stability:**
+
+- Adam with `weight_decay=1e-4`.
+- `CosineAnnealingWarmRestarts` (`T_0=30, T_mult=2`) provides periodic learning rate resets, helping the model escape local minima induced by noisy gradient batches.
+- Gradient clipping at norm 5.0 prevents exploding gradients on high-loss noisy batches.
+- Early stopping with 20-epoch patience (post-warmup only) saves the best checkpoint by validation accuracy on `val_sanity.pt`.
+
+**Augmentation (permitted only — no corruption augmentations):**
 
 - `RandomCrop(28, padding=4)`
 - `RandomHorizontalFlip(p=0.5)`
 - `RandomAffine(degrees=10, translate=0.1, scale=0.9–1.1)`
 
-No corruption augmentations (AugMix, blur, noise) are used, as prohibited by competition rules.
+Augmentation runs inside DataLoader workers for parallel, non-blocking data loading.
 
 ---
 
-### Phase 2 — Blind Adaptation (model_submission.py)
+### Phase 2 — Blind Adaptation (`model_submission.py`)
 
-**Problem:** At inference time, the target domain has no labels and a different class distribution (label shift) and different pixel statistics (covariate shift / sensor noise).
+**Problem:** At inference time, the target domain has different pixel statistics (covariate shift from sensor noise) and a different class distribution (label shift from class imbalance). No labels are available.
 
-**Solution: Two-stage automatic TTA on the first `eval()` forward call**
+**Solution: Two-stage automatic TTA, self-triggered on the first `eval()` forward call**
 
-The model detects when it is in `eval()` mode and has not yet adapted (`_adapted = False`). On the first call it runs two sequential adaptation steps, then sets `_adapted = True` so subsequent calls just run prediction.
+The `forward()` method detects when it is in `eval()` mode and `_adapted` is `False`. On the first call it runs two sequential adaptation steps, sets `_adapted = True`, and all subsequent calls simply predict with the stored corrections. This means the standard Kaggle evaluation template (`model.eval(); preds = model(images).argmax(1)`) works with **zero modifications**.
 
-**Step 1 — BN Statistics Reset (Covariate Shift)**
+**Step 1 — BN Statistics Reset (handles covariate shift)**
 
-Batch Normalisation layers store running mean and variance computed on the source (clean) distribution. The target domain has different pixel statistics due to sensor noise. The BN stats reset:
+Batch Normalisation layers store running mean and variance computed on the source distribution during training. When the target domain has different pixel statistics (e.g. added Gaussian noise shifts the mean and variance), these stored statistics cause all downstream feature maps to be incorrectly normalised, degrading accuracy significantly.
 
-1. Switches the model temporarily to `train()` mode (so BN layers accumulate statistics).
-2. Sets `momentum=None` (cumulative average) and resets all BN running stats.
-3. Passes all target images through the backbone in a single forward sweep with no gradients.
+The BN reset procedure:
+1. Switches the model temporarily to `train()` mode so BN layers accumulate new statistics.
+2. Sets `momentum=None` (cumulative average mode) and resets all BN running stats to zero.
+3. Passes all target images through the backbone in a single forward sweep with no gradients — this populates the running stats with exact target-domain statistics.
 4. Restores `momentum=0.1` and switches back to `eval()` mode.
 
-This recalibrates the normalisation layers to the target distribution without any labels.
+This re-fits the normalisation layers to the target distribution using only the unlabelled target images, with no parameter updates.
 
-**Step 2 — EM Label-Shift Estimation (Label Shift)**
+**Step 2 — EM Label-Shift Estimation (handles label shift)**
 
-Class imbalance means the prior `p_t(y)` in the target domain differs from the source `p_s(y)` (which is approximately uniform). The Black-Box EM algorithm (Lipton et al., ICML 2018) estimates importance weights `w_t = p_t(y) / p_s(y)` from the model's own soft predictions:
+Class imbalance means the prior `p_t(y)` in the target domain differs from the source prior `p_s(y)` (approximately uniform due to balanced training). Without correction, the model's predictions are biased toward classes that were frequent at training time, hurting Macro-F1 on under-represented target classes.
 
-1. Collect softmax probabilities for all target images.
-2. Run EM iterations: re-weight predictions by current `w_t`, re-estimate `p_t`, repeat until convergence (max 50 iterations, tolerance `1e-6`).
-3. Store `log(w_t)` as a buffer on the model.
+The **Black-Box EM algorithm** (Lipton et al., ICML 2018) estimates importance weights `w_t = p_t(y) / p_s(y)` using only the model's own soft predictions:
 
-At prediction time, the stored `log(w_t)` is added directly to the output logits, which is equivalent to multiplying probabilities by the importance weights in probability space. This corrects the model's implicit class prior from uniform to the target distribution.
+1. Initialise `p_t = p_s = uniform`.
+2. Re-weight each sample's predicted probability vector by current `w_t`.
+3. Re-normalise to get a posterior, then re-estimate `p_t` as the mean posterior.
+4. Repeat until convergence (max 50 iterations, tolerance `1e-6`).
+5. Store `log(w_t)` as a buffer on the model.
 
-**Per-Domain Isolation:**
+At prediction time, the stored `log(w_t)` is **added directly to the output logits** before `argmax`. This is numerically equivalent to multiplying softmax probabilities by `w_t` in probability space, but avoids a redundant softmax-then-multiply and integrates cleanly with the existing `forward()` return value.
 
-Calling `model.reset()` between domains restores pristine BN statistics and clears the EM weights, ensuring each scenario is adapted independently.
+**Adaptation State Machine:**
+
+| State | `_adapted` | `_log_w_t` | Next `forward()` action |
+|---|---|---|---|
+| Just loaded | `False` | zeros | Runs BNStats + EM, then predicts |
+| After first eval call | `True` | estimated | Just predicts + adds bias |
+| After `reset()` | `False` | zeros | Runs BNStats + EM again |
 
 ---
 
-### Phase 3 — Stress Test Robustness
+### Phase 3 — Stress Test Robustness (`generate_submission.py`)
 
-No explicit training is done for Phase 3. The design choices in Phases 1 and 2 are intended to generalise:
+No additional training is performed for Phase 3. The submission generator handles the 24-scenario suite by calling `model.reset()` before each scenario, which restores the pristine trained BN statistics and clears the EM weights. Each scenario is then adapted independently from the same clean baseline.
 
-- GCE training produces a more calibrated model that is less over-confident on any one corruption.
-- BN reset handles a wide variety of covariate shifts (blur, noise, contrast change) because it re-estimates statistics from whatever distribution is presented.
-- EM correction handles class imbalance shifts without needing any labels.
+The generator also logs the prediction distribution and number of unique classes for each domain — useful for diagnosing degenerate scenarios where the model collapses to predicting a single class.
+
+The robustness of the base approach across diverse corruptions comes from:
+- GCE training producing a well-calibrated model that is not over-confident on any particular distribution.
+- BN reset adapting to whatever pixel statistics are present in a given scenario.
+- EM correction adapting to whatever class imbalance is present in that scenario.
 
 ---
 
@@ -130,26 +150,27 @@ No explicit training is done for Phase 3. The design choices in Phases 1 and 2 a
 
 ```
 submission/
-├── train.py               # Phase 1 robust training script
-├── model_submission.py    # RobustClassifier architecture + TTA
-├── weights.pth            # Trained model weights
-└── submission.csv         # Final predictions
+├── train.py                  # Phase 1: robust training script
+├── model_submission.py       # RobustClassifier architecture + TTA
+├── generate_submission.py    # Submission generator
+├── weights.pth               # Trained model weights
+└── submission.csv            # Final predictions (generated output)
 ```
 
-Data files (not included in submission):
+Data files (not included in submission, expected in `./data/`):
 ```
-data/
-├── source_toxic.pt        # 60,000 training images with 30% label noise
-├── static.pt              # 10,000 unlabelled target images
-├── val_sanity.pt          # 100 clean validation images (10 per class)
-└── test_suite_public.pt   # 24-scenario local test suite
+data/hackenza-2026-test-time-adaptation-in-the-wild/
+├── source_toxic.pt           # 60,000 training images with 30% label noise
+├── static.pt                 # 10,000 unlabelled target images
+├── val_sanity.pt             # 100 clean validation images (10 per class)
+└── test_suite_public.pt      # 24-scenario local test suite
 ```
 
 ---
 
 ## Setup & Installation
 
-**Requirements:** Python 3.8+, CUDA (optional but recommended)
+**Requirements:** Python 3.8+, CUDA (optional but strongly recommended for training)
 
 ```bash
 pip install torch torchvision pandas numpy
@@ -159,82 +180,97 @@ pip install torch torchvision pandas numpy
 
 ## Running the Project
 
-### Train the model
+### Step 1 — Train the model
 
 ```bash
 python train.py \
-    --source ./data/source_toxic.pt \
-    --val    ./data/val_sanity.pt   \
+    --source ./data/hackenza-2026-test-time-adaptation-in-the-wild/source_toxic.pt \
+    --val    ./data/hackenza-2026-test-time-adaptation-in-the-wild/val_sanity.pt   \
     --output weights.pth
 ```
 
-**All training arguments (with defaults):**
+All training arguments with their defaults:
 
 | Argument | Default | Description |
 |---|---|---|
 | `--source` | `./data/.../source_toxic.pt` | Path to noisy training data |
-| `--val` | `./data/.../val_sanity.pt` | Path to sanity validation set |
+| `--val` | `./data/.../val_sanity.pt` | Path to clean sanity validation set |
 | `--output` | `weights.pth` | Output path for saved weights |
 | `--epochs` | `100` | Maximum training epochs |
 | `--batch_size` | `128` | Batch size |
 | `--lr` | `3e-4` | Initial learning rate |
-| `--gce_q` | `0.7` | GCE robustness parameter |
-| `--forget_rate` | `0.30` | Fraction of samples filtered per batch |
-| `--warmup` | `10` | Warmup epochs (standard CE, no filtering) |
-| `--patience` | `20` | Early stopping patience (post-warmup) |
-| `--seed` | `42` | Random seed for reproducibility |
+| `--gce_q` | `0.7` | GCE robustness parameter (higher = more robust to noise) |
+| `--forget_rate` | `0.30` | Fraction of noisy samples filtered per batch |
+| `--warmup` | `10` | Warmup epochs using standard CE with no filtering |
+| `--patience` | `20` | Early stopping patience (post-warmup only) |
+| `--seed` | `42` | Random seed for full reproducibility |
 
-### Verify the model architecture
+A healthy training run should reach >90% validation accuracy on `val_sanity.pt` within 30–50 epochs. Training progress is printed each epoch including loss, train accuracy, val accuracy, and current learning rate.
+
+### Step 2 — Verify the model architecture
 
 ```bash
 python model_submission.py
 ```
 
-This runs a built-in sanity check that prints the output shapes, confirms `_adapted` flips to `True` after the first eval forward pass, and prints the estimated `log_w_t` weights.
+This runs the built-in sanity check and should print:
+
+```
+Train output : torch.Size([8, 10])
+Eval output  : torch.Size([500, 10])
+_adapted     : True
+log_w_t      : [...]      # non-zero after EM estimation
+After reset  : False      # reset() correctly cleared state
+Parameters   : 11,181,642
+```
 
 ---
 
 ## Generating a Submission
 
-Use the official template provided by the competition:
-
-```python
-import torch
-import pandas as pd
-from model_submission import RobustClassifier
-
-def generate_submission(model, static_path, suite_path):
-    model.eval()
-    results = []
-
-    # Static set (Public Leaderboard)
-    static = torch.load(static_path)
-    # First call triggers BNStats reset + EM estimation automatically
-    with torch.no_grad():
-        preds = model(static['images']).argmax(1)
-        for i, p in enumerate(preds):
-            results.append({'ID': f'static_{i}', 'Category': int(p)})
-
-    # 24-scenario suite (Private Leaderboard)
-    suite = torch.load(suite_path)
-    scenario_keys = sorted([k for k in suite.keys() if k.startswith('scenario')])
-
-    for skey in scenario_keys:
-        model.reset()  # Re-adapt independently for each scenario
-        scenario_images = suite[skey]
-        with torch.no_grad():
-            preds = model(scenario_images).argmax(1)
-            for i, p in enumerate(preds):
-                results.append({'ID': f'{skey}_{i}', 'Category': int(p)})
-
-    pd.DataFrame(results).to_csv('submission.csv', index=False)
-
-model = RobustClassifier()
-model.load_weights('weights.pth')
-generate_submission(model, 'static.pt', 'test_suite_public.pt')
+```bash
+python generate_submission.py \
+    --weights weights.pth \
+    --static  ./data/hackenza-2026-test-time-adaptation-in-the-wild/static.pt \
+    --suite   ./data/hackenza-2026-test-time-adaptation-in-the-wild/test_suite_public.pt \
+    --output  submission.csv
 ```
 
-> **Important:** `model.reset()` must be called before each new scenario. This restores the trained BN statistics and clears the EM weights so each domain is adapted from the same clean baseline.
+All arguments with their defaults:
+
+| Argument | Default | Description |
+|---|---|---|
+| `--weights` | `weights.pth` | Path to trained weights |
+| `--static` | `./data/.../static.pt` | Path to public leaderboard target set |
+| `--suite` | `./data/.../test_suite_public.pt` | Path to 24-scenario test suite |
+| `--output` | `submission.csv` | Output CSV path |
+
+**What the generator does:**
+
+1. Loads the model once and moves it to the available device (GPU or CPU).
+2. Runs `static.pt` through `run_domain()` — which calls `model.reset()` then a single `forward()` pass (triggering BNStats + EM automatically) and collects `static_0`, `static_1`, ... predictions.
+3. Iterates over all 24 scenario keys (sorted), calling `model.reset()` before each one so adaptation is independent per domain.
+4. Writes all predictions to `submission.csv` with columns `ID` and `Category`.
+
+For each domain the generator prints a live prediction distribution and timing, making it easy to spot degenerate scenarios where the model collapses to predicting a single class:
+
+```
+[scenario_01] images: torch.Size([500, 1, 28, 28])
+[scenario_01] distribution : {0: 48, 1: 52, 2: 61, ...}
+[scenario_01] unique classes: 10/10  |  time: 1.3s
+```
+
+The output CSV will have the following structure:
+
+```
+ID,Category
+static_0,3
+static_1,7
+...
+scenario_01_0,2
+scenario_01_1,5
+...
+```
 
 ---
 
@@ -242,62 +278,57 @@ generate_submission(model, 'static.pt', 'test_suite_public.pt')
 
 ### Competition Compliance Checklist
 
-| Requirement | Status | How |
+| Requirement | Status | Where enforced |
 |---|---|---|
-| Random weight initialisation only | ✓ | `resnet18(weights=None)` + Kaiming init |
-| No pretrained / external weights | ✓ | No `torch.hub`, no external state dicts |
-| No corruption augmentations | ✓ | Only crop, flip, affine in `TRAIN_AUG` |
-| No external clean data | ✓ | `static.pt` never loaded in `train.py` |
-| `static.pt` used only for adaptation | ✓ | TTA happens inside `forward()` at eval time |
-| Fully reproducible via `train.py` | ✓ | Fixed seed, deterministic CUDA |
+| Random weight initialisation only | ✓ | `resnet18(weights=None)` + Kaiming init in `_init_weights()` |
+| No pretrained / external weights | ✓ | No `torch.hub`, no external state dicts loaded |
+| No corruption augmentations | ✓ | Only crop, flip, affine in `TRAIN_AUG` — no AugMix, blur, or noise |
+| No external clean data | ✓ | `static.pt` is never loaded or referenced in `train.py` |
+| `static.pt` used only for adaptation | ✓ | TTA runs entirely inside `forward()` at eval time |
+| Fully reproducible via `train.py` | ✓ | Fixed seed, `deterministic=True`, `benchmark=False` |
 
-### Why ResNet-18 and not a custom CNN?
+### Why GCE over Co-teaching or DivideMix?
 
-ResNet-18's residual connections provide stable gradient flow during noisy training — deep plain networks can have their gradients dominated by the high-loss noisy samples. The architecture is minimal (11M parameters) but well-studied.
-
-### Why GCE over Co-teaching or DIVIDEMIX?
-
-Co-teaching and DivideMix require two networks and are significantly more complex to implement and tune. GCE with a small-loss filter is a single-model approach that achieves comparable noise robustness with far less risk of implementation bugs, which matters for a reproducibility audit.
+Co-teaching and DivideMix require two networks trained in parallel, significantly more hyperparameters, and complex coordination logic. GCE with a small-loss filter achieves comparable noise robustness as a single-model approach with far less implementation risk — important when the submission undergoes a forensic reproducibility audit.
 
 ### Why add `log(w_t)` to logits rather than re-weighting probabilities?
 
-Adding a constant offset to logits before `argmax` is numerically identical to multiplying softmax probabilities by the weights. The logit formulation is simpler to implement, avoids a redundant softmax-then-multiply, and integrates cleanly with the existing `forward()` return value.
+Adding a constant offset to logits before `argmax` is numerically identical to multiplying softmax probabilities by the weights. The logit formulation avoids a redundant softmax-then-multiply operation and integrates directly with the `forward()` return value without changing its interface.
+
+### Why are BN stats restored from a snapshot rather than re-initialised from scratch?
+
+The pristine snapshot (`_pristine_bn`) is taken right after `load_weights()` and captures the BN statistics exactly as they were at the end of training on the source domain. `reset()` restores *this snapshot* — not randomly-initialised stats — so each new scenario starts from the correct post-training baseline rather than from zero.
+
+### Why does TTA trigger inside `forward()` rather than in a separate `adapt()` call?
+
+Embedding adaptation in `forward()` means the standard Kaggle evaluation template (`model.eval(); preds = model(images).argmax(1)`) works with zero modifications. There is no risk of a user forgetting to call `adapt()` before prediction. The only additional requirement is calling `model.reset()` between domains, which is clearly documented and handled in `generate_submission.py`.
 
 ---
 
 ## Unit Testing & Sanity Checks
 
-### Built-in architecture test
+### 1. Architecture and TTA state machine
 
 ```bash
 python model_submission.py
 ```
 
-Expected output:
-```
-Train output : torch.Size([8, 10])
-Eval output  : torch.Size([500, 10])
-_adapted     : True
-log_w_t      : [...]          # non-zero after EM estimation
-After reset  : False          # reset() correctly clears state
-Parameters   : 11,181,642     # (approximate)
-```
+Verifies output shapes, that `_adapted` transitions correctly on the first eval forward call, that `log_w_t` is non-trivial after EM estimation, and that `reset()` returns the model to its unadapted state.
 
-### Validating training logic
-
-The `val_sanity.pt` set (100 clean images, 10 per class) is used exclusively to check that the model is learning real signal and to trigger early stopping. A healthy run should reach >90% val accuracy within 30–50 epochs.
-
-### Checking submission format
+### 2. Submission format validation
 
 ```python
 import pandas as pd
+
 df = pd.read_csv('submission.csv')
-assert list(df.columns) == ['ID', 'Category']
-assert df['Category'].between(0, 9).all()
-print(f"Total predictions: {len(df)}")  # Should be 10000 + sum of scenario sizes
+assert list(df.columns) == ['ID', 'Category'], "Wrong columns"
+assert df['Category'].between(0, 9).all(), "Labels out of range [0, 9]"
+assert df['ID'].str.match(r'^(static|scenario)_').all(), "Bad ID format"
+assert not df['ID'].duplicated().any(), "Duplicate IDs found"
+print(f"Total rows: {len(df)}")  # 10000 (static) + sum of all scenario sizes
 ```
 
-### Manual BN adaptation check
+### 3. BN adaptation state check
 
 ```python
 import torch
@@ -307,19 +338,26 @@ model = RobustClassifier()
 model.load_weights('weights.pth')
 model.eval()
 
-# Confirm not adapted yet
-assert not model._adapted
+assert not model._adapted, "Should not be adapted yet after load"
 
-# Run one forward pass
 with torch.no_grad():
     _ = model(torch.rand(500, 1, 28, 28))
 
-# Confirm adaptation ran
-assert model._adapted
-assert model._log_w_t.abs().sum() > 0  # weights are non-trivial
+assert model._adapted, "Should be adapted after first eval forward pass"
+assert model._log_w_t.abs().sum() > 0, "EM weights should be non-zero"
 
-# Confirm reset works
 model.reset()
-assert not model._adapted
-assert model._log_w_t.abs().sum() == 0
+assert not model._adapted, "reset() should clear adapted flag"
+assert model._log_w_t.abs().sum() == 0, "reset() should zero log_w_t"
+print("All adaptation state checks passed.")
 ```
+
+### 4. Training smoke test
+
+Run for 2 epochs to verify the full pipeline executes without errors before committing to a full run:
+
+```bash
+python train.py --epochs 2 --batch_size 64 --output smoke_test.pth
+```
+
+Expected: loss decreases from epoch 1 to epoch 2, val accuracy is printed, and `smoke_test.pth` is written to disk with no errors.
