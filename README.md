@@ -28,7 +28,7 @@ The challenge simulates a robot deployed in a hostile environment where three co
 
 3. **Stress Test** — The final model is evaluated across **24 hidden corruption scenarios** at multiple severity levels, requiring genuine generalisation rather than overfitting to a single distribution.
 
-The evaluation metrics are **Robust Accuracy**, **Macro-F1** (critical due to class imbalance — solutions that over-predict majority classes will be penalised), and a weighted **Robustness Score** that penalises failures at high severity.
+Standard Cross-Entropy training + standard inference fails all three. This pipeline addresses each one explicitly.
 
 ---
 
@@ -230,47 +230,43 @@ Parameters   : 11,181,642
 
 ```bash
 python generate_submission.py \
-    --weights weights.pth \
-    --static  ./data/hackenza-2026-test-time-adaptation-in-the-wild/static.pt \
-    --suite   ./data/hackenza-2026-test-time-adaptation-in-the-wild/test_suite_public.pt \
+    --weights weights.pth           \
+    --static  static.pt             \
+    --suite   test_suite_public.pt  \
     --output  submission.csv
 ```
 
-All arguments with their defaults:
+This will:
+1. Load the trained model
+2. For each domain (static + 24 scenarios): call `model.reset()`, then `model(images)` which triggers BNStats + EM automatically
+3. Write predictions to `submission.csv`
 
-| Argument | Default | Description |
-|---|---|---|
-| `--weights` | `weights.pth` | Path to trained weights |
-| `--static` | `./data/.../static.pt` | Path to public leaderboard target set |
-| `--suite` | `./data/.../test_suite_public.pt` | Path to 24-scenario test suite |
-| `--output` | `submission.csv` | Output CSV path |
+---
 
-**What the generator does:**
+## How the Adaptation Works
 
-1. Loads the model once and moves it to the available device (GPU or CPU).
-2. Runs `static.pt` through `run_domain()` — which calls `model.reset()` then a single `forward()` pass (triggering BNStats + EM automatically) and collects `static_0`, `static_1`, ... predictions.
-3. Iterates over all 24 scenario keys (sorted), calling `model.reset()` before each one so adaptation is independent per domain.
-4. Writes all predictions to `submission.csv` with columns `ID` and `Category`.
+The core of the solution is `RobustClassifier.forward()`:
 
-For each domain the generator prints a live prediction distribution and timing, making it easy to spot degenerate scenarios where the model collapses to predicting a single class:
+```python
+def forward(self, x):
+    if self.training:
+        return self.backbone(x)          # pure forward during training
 
+    if not self._adapted:
+        self._bnstats_reset(x)           # Step 1: recompute BN stats from target
+        probs = get_softmax_probs(x)     
+        w_t = self._em_estimate_w_t(probs)  # Step 2: estimate target class prior
+        self._log_w_t = log(w_t)         # store logit bias
+        self._adapted = True
+
+    return self.backbone(x) + self._log_w_t   # predict with label-shift correction
 ```
-[scenario_01] images: torch.Size([500, 1, 28, 28])
-[scenario_01] distribution : {0: 48, 1: 52, 2: 61, ...}
-[scenario_01] unique classes: 10/10  |  time: 1.3s
-```
 
-The output CSV will have the following structure:
+**BNStats Reset** — BatchNorm layers store running mean and variance from training data. When target images have different statistics due to corruption, all BN normalizations use wrong reference values. `_bnstats_reset()` sets `momentum=None` (cumulative average mode), zeros the buffers, and runs one full forward pass over the target images to recompute correct statistics.
 
-```
-ID,Category
-static_0,3
-static_1,7
-...
-scenario_01_0,2
-scenario_01_1,5
-...
-```
+**EM Label Shift Estimation** — Iteratively estimates the target class distribution `p_t(y)` from the model's softmax predictions. Applies importance weights `w_t = p_t(y) / p_s(y)` as a logit bias `log(w_t)`. Classes more common in the target domain get their logits boosted; rare classes are penalized. Runs once on the full dataset for stable estimates.
+
+**Per-scenario isolation** — `model.reset()` restores pristine BN buffers and clears `_adapted`, so each of the 24 scenarios gets a fresh adaptation from the base trained weights.
 
 ---
 
@@ -278,86 +274,11 @@ scenario_01_1,5
 
 ### Competition Compliance Checklist
 
-| Requirement | Status | Where enforced |
-|---|---|---|
-| Random weight initialisation only | ✓ | `resnet18(weights=None)` + Kaiming init in `_init_weights()` |
-| No pretrained / external weights | ✓ | No `torch.hub`, no external state dicts loaded |
-| No corruption augmentations | ✓ | Only crop, flip, affine in `TRAIN_AUG` — no AugMix, blur, or noise |
-| No external clean data | ✓ | `static.pt` is never loaded or referenced in `train.py` |
-| `static.pt` used only for adaptation | ✓ | TTA runs entirely inside `forward()` at eval time |
-| Fully reproducible via `train.py` | ✓ | Fixed seed, `deterministic=True`, `benchmark=False` |
-
-### Why GCE over Co-teaching or DivideMix?
-
-Co-teaching and DivideMix require two networks trained in parallel, significantly more hyperparameters, and complex coordination logic. GCE with a small-loss filter achieves comparable noise robustness as a single-model approach with far less implementation risk — important when the submission undergoes a forensic reproducibility audit.
-
-### Why add `log(w_t)` to logits rather than re-weighting probabilities?
-
-Adding a constant offset to logits before `argmax` is numerically identical to multiplying softmax probabilities by the weights. The logit formulation avoids a redundant softmax-then-multiply operation and integrates directly with the `forward()` return value without changing its interface.
-
-### Why are BN stats restored from a snapshot rather than re-initialised from scratch?
-
-The pristine snapshot (`_pristine_bn`) is taken right after `load_weights()` and captures the BN statistics exactly as they were at the end of training on the source domain. `reset()` restores *this snapshot* — not randomly-initialised stats — so each new scenario starts from the correct post-training baseline rather than from zero.
-
-### Why does TTA trigger inside `forward()` rather than in a separate `adapt()` call?
-
-Embedding adaptation in `forward()` means the standard Kaggle evaluation template (`model.eval(); preds = model(images).argmax(1)`) works with zero modifications. There is no risk of a user forgetting to call `adapt()` before prediction. The only additional requirement is calling `model.reset()` between domains, which is clearly documented and handled in `generate_submission.py`.
-
----
-
-## Unit Testing & Sanity Checks
-
-### 1. Architecture and TTA state machine
-
-```bash
-python model_submission.py
-```
-
-Verifies output shapes, that `_adapted` transitions correctly on the first eval forward call, that `log_w_t` is non-trivial after EM estimation, and that `reset()` returns the model to its unadapted state.
-
-### 2. Submission format validation
-
-```python
-import pandas as pd
-
-df = pd.read_csv('submission.csv')
-assert list(df.columns) == ['ID', 'Category'], "Wrong columns"
-assert df['Category'].between(0, 9).all(), "Labels out of range [0, 9]"
-assert df['ID'].str.match(r'^(static|scenario)_').all(), "Bad ID format"
-assert not df['ID'].duplicated().any(), "Duplicate IDs found"
-print(f"Total rows: {len(df)}")  # 10000 (static) + sum of all scenario sizes
-```
-
-### 3. BN adaptation state check
-
-```python
-import torch
-from model_submission import RobustClassifier
-
-model = RobustClassifier()
-model.load_weights('weights.pth')
-model.eval()
-
-assert not model._adapted, "Should not be adapted yet after load"
-
-with torch.no_grad():
-    _ = model(torch.rand(500, 1, 28, 28))
-
-assert model._adapted, "Should be adapted after first eval forward pass"
-assert model._log_w_t.abs().sum() > 0, "EM weights should be non-zero"
-
-model.reset()
-assert not model._adapted, "reset() should clear adapted flag"
-assert model._log_w_t.abs().sum() == 0, "reset() should zero log_w_t"
-print("All adaptation state checks passed.")
-```
-
-### 4. Training smoke test
-
-Run for 2 epochs to verify the full pipeline executes without errors before committing to a full run:
-
-```bash
-python train.py --epochs 2 --batch_size 64 --output smoke_test.pth
-```
-
-Expected: loss decreases from epoch 1 to epoch 2, val accuracy is printed, and `smoke_test.pth` is written to disk with no errors.
+| Requirement | Status |
+|---|---|
+| Random weight initialisation only | ✅ `weights=None` throughout |
+| No pretrained / external weights | ✅ Only `source_toxic.pt` used in training |
+| No corruption augmentations | ✅ Only crop, flip, affine in `TRAIN_AUG` — no AugMix, blur, or noise |
+| No external clean data | ✅ `static.pt` is never loaded or referenced in `train.py` |
+| `static.pt` used only for adaptation | ✅ TTA runs entirely inside `forward()` at eval time |
+| Fully reproducible via `train.py` | ✅ Fixed seed, `deterministic=True`, `benchmark=False` |
