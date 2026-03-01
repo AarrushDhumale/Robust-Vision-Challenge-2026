@@ -64,14 +64,15 @@ class GCELoss(nn.Module):
     Returns per-sample losses so the small-loss filter can mask them.
     q=0.7 is robust against symmetric noise up to ~50%.
     """
-    def __init__(self, q: float = 0.7):
+
+    def __init__(self, q: float = 0.65):
         super().__init__()
         self.q = q
 
     def forward(self, logits: torch.Tensor,
                 targets: torch.Tensor) -> torch.Tensor:
         probs = F.softmax(logits, dim=1)
-        p_y   = probs.gather(1, targets.view(-1, 1)).squeeze(1).clamp(min=1e-7)
+        p_y = probs.gather(1, targets.view(-1, 1)).squeeze(1).clamp(min=1e-7)
         return (1.0 - p_y ** self.q) / self.q   # [B], per-sample
 
 
@@ -90,8 +91,8 @@ def small_loss_mask(losses: torch.Tensor,
     if epoch <= warmup:
         return torch.ones(len(losses), dtype=torch.bool, device=losses.device)
     n_keep = max(1, int(len(losses) * (1.0 - forget_rate)))
-    _, idx  = losses.topk(n_keep, largest=False, sorted=False)
-    mask    = torch.zeros(len(losses), dtype=torch.bool, device=losses.device)
+    _, idx = losses.topk(n_keep, largest=False, sorted=False)
+    mask = torch.zeros(len(losses), dtype=torch.bool, device=losses.device)
     mask[idx] = True
     return mask
 
@@ -103,7 +104,7 @@ def small_loss_mask(losses: torch.Tensor,
 def load_tensors(path: str):
     if not os.path.exists(path):
         raise FileNotFoundError(f"Dataset not found: {path}")
-    raw  = torch.load(path, map_location="cpu")
+    raw = torch.load(path, map_location="cpu")
     imgs = raw["images"] if isinstance(raw, dict) else raw[0]
     lbls = raw["labels"] if isinstance(raw, dict) else raw[1]
     imgs = imgs.float()
@@ -126,9 +127,10 @@ class AugDataset(Dataset):
     fast, parallel, no Python loop bottleneck in the training loop.
     Set transform=None for the val set.
     """
+
     def __init__(self, images, labels, transform=None):
-        self.images    = images
-        self.labels    = labels
+        self.images = images
+        self.labels = labels
         self.transform = transform
 
     def __len__(self):
@@ -154,7 +156,7 @@ def evaluate(model: nn.Module,
     for imgs, lbls in loader:
         preds = model(imgs.to(device)).argmax(1)
         correct += (preds == lbls.to(device)).sum().item()
-        total   += len(lbls)
+        total += len(lbls)
     return correct / total
 
 
@@ -181,17 +183,17 @@ def train(args):
     # ── Data ──────────────────────────────────────────────────────────────────────
     print('\n[DATA] Loading...')
     train_imgs, train_lbls = load_tensors(args.source)
-    val_imgs,   val_lbls   = load_tensors(args.val)
+    val_imgs,   val_lbls = load_tensors(args.val)
 
     # Augmentation runs inside DataLoader workers - fast and parallel
     train_ds = AugDataset(train_imgs, train_lbls, transform=TRAIN_AUG)
-    val_ds   = AugDataset(val_imgs,   val_lbls,   transform=None)
+    val_ds = AugDataset(val_imgs,   val_lbls,   transform=None)
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size,
                               shuffle=True, num_workers=4, pin_memory=True,
                               drop_last=True, persistent_workers=True)
-    val_loader   = DataLoader(val_ds, batch_size=256,
-                              shuffle=False, num_workers=2, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=256,
+                            shuffle=False, num_workers=2, pin_memory=True)
     print(f'  Train: {len(train_ds):,} samples  |  Val: {len(val_ds)} samples')
     # ── Model ──────────────────────────────────────────────────────────────
     model = RobustClassifier(num_classes=10).to(device)
@@ -200,7 +202,7 @@ def train(args):
 
     # ── Loss & optimizer ───────────────────────────────────────────────────
     gce = GCELoss(q=args.gce_q)
-    ce  = nn.CrossEntropyLoss(reduction='none')  # warmup
+    ce = nn.CrossEntropyLoss(reduction='none', label_smoothing=0.05)
 
     optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
@@ -209,8 +211,8 @@ def train(args):
 
     # ── Loop ───────────────────────────────────────────────────────────────
     best_val_acc = 0.0
-    best_state   = None
-    no_improve   = 0
+    best_state = None
+    no_improve = 0
 
     print('\n[TRAIN] Starting…\n')
     for epoch in range(1, args.epochs + 1):
@@ -225,10 +227,19 @@ def train(args):
 
             # Warmup: CE on all samples; afterwards: GCE + small-loss filter
             per_sample = ce(logits, lbls) if epoch <= args.warmup \
-                         else gce(logits, lbls)
+                else gce(logits, lbls)
 
-            mask = small_loss_mask(per_sample.detach(), args.forget_rate,
-                                   epoch, args.warmup)
+            # Gradually ramp forget rate after warmup
+            if epoch <= args.warmup:
+                current_forget = 0.0
+            else:
+                progress = min(1.0, (epoch - args.warmup) / args.warmup)
+                current_forget = args.forget_rate * progress
+
+            mask = small_loss_mask(per_sample.detach(),
+                                   current_forget,
+                                   epoch,
+                                   args.warmup)
             if mask.sum() == 0:
                 continue
 
@@ -239,15 +250,15 @@ def train(args):
             optimizer.step()
 
             epoch_loss += loss.item()
-            correct    += (logits.detach().argmax(1) == lbls).sum().item()
-            total      += len(lbls)
+            correct += (logits.detach().argmax(1) == lbls).sum().item()
+            total += len(lbls)
 
         scheduler.step()
 
-        val_acc   = evaluate(model, val_loader, device)
+        val_acc = evaluate(model, val_loader, device)
         train_acc = correct / max(total, 1)
-        lr_now    = scheduler.get_last_lr()[0]
-        tag       = '  ← WARMUP' if epoch <= args.warmup else ''
+        lr_now = scheduler.get_last_lr()[0]
+        tag = '  ← WARMUP' if epoch <= args.warmup else ''
 
         print(f'Epoch {epoch:3d}/{args.epochs} | '
               f'Loss {epoch_loss/len(train_loader):.4f} | '
@@ -257,14 +268,16 @@ def train(args):
 
         if val_acc > best_val_acc:
             best_val_acc = val_acc
-            best_state   = copy.deepcopy(model.state_dict())
+            best_state = copy.deepcopy(model.state_dict())
             torch.save(best_state, args.output)
-            no_improve   = 0
-            print(f'         ✓ Best val acc {best_val_acc*100:.2f}% → {args.output}')
+            no_improve = 0
+            print(
+                f'         ✓ Best val acc {best_val_acc*100:.2f}% → {args.output}')
         else:
             no_improve += 1
             if no_improve >= args.patience and epoch > args.warmup:
-                print(f'\nEarly stop: no improvement for {args.patience} epochs.')
+                print(
+                    f'\nEarly stop: no improvement for {args.patience} epochs.')
                 break
 
     # ── Restore best weights ───────────────────────────────────────────────
@@ -281,8 +294,10 @@ def train(args):
 
 if __name__ == '__main__':
     p = argparse.ArgumentParser()
-    p.add_argument('--source',      default='./data/hackenza-2026-test-time-adaptation-in-the-wild/source_toxic.pt')
-    p.add_argument('--val',         default='./data/hackenza-2026-test-time-adaptation-in-the-wild/val_sanity.pt')
+    p.add_argument(
+        '--source',      default='./data/hackenza-2026-test-time-adaptation-in-the-wild/source_toxic.pt')
+    p.add_argument(
+        '--val',         default='./data/hackenza-2026-test-time-adaptation-in-the-wild/val_sanity.pt')
     p.add_argument('--output',      default='weights.pth')
     p.add_argument('--epochs',      type=int,   default=100)
     p.add_argument('--batch_size',  type=int,   default=128)

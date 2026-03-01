@@ -33,10 +33,13 @@ class RobustClassifier(nn.Module):
 
         # ── Backbone (random init, no pretrained weights) ─────────────────
         backbone = resnet18(weights=None)
-        backbone.conv1   = nn.Conv2d(1, 64, kernel_size=3,
-                                     stride=1, padding=1, bias=False)
+        backbone.conv1 = nn.Conv2d(1, 64, kernel_size=3,
+                                   stride=1, padding=1, bias=False)
         backbone.maxpool = nn.Identity()   # preserve 28x28 spatial res
-        backbone.fc      = nn.Linear(backbone.fc.in_features, num_classes)
+        backbone.fc = nn.Sequential(
+            nn.Dropout(0.2),  # mild regularization
+            nn.Linear(backbone.fc.in_features, num_classes)
+        )
         self.backbone = backbone
 
         # ── Adaptation state ──────────────────────────────────────────────
@@ -115,16 +118,16 @@ class RobustClassifier(nn.Module):
         Uses cumulative average (momentum=None) for exact statistics.
         One forward pass, no gradients.
         """
-        self.train()
-        for m in self.modules():
-            if isinstance(m, (nn.BatchNorm2d, nn.BatchNorm1d)):
-                m.momentum = None
-                m.reset_running_stats()
+        device = next(self.parameters()).device
+
+        # Multi-pass for small domains
+        n_passes = 2 if len(images) < 3000 else 1
 
         with torch.no_grad():
-            device = next(self.parameters()).device
-            for i in range(0, len(images), batch_size):
-                self.backbone(images[i:i + batch_size].to(device))
+            for _ in range(n_passes):
+                for i in range(0, len(images), batch_size):
+                    chunk = images[i:i + batch_size].to(device)
+                    self.backbone(chunk)
 
         for m in self.modules():
             if isinstance(m, (nn.BatchNorm2d, nn.BatchNorm1d)):
@@ -137,23 +140,25 @@ class RobustClassifier(nn.Module):
 
     @torch.no_grad()
     def _em_estimate_w_t(self, probs: torch.Tensor,
-                          max_iter: int = 50,
-                          tol: float = 1e-6) -> torch.Tensor:
+                         max_iter: int = 50,
+                         tol: float = 1e-6) -> torch.Tensor:
         """
         Black-box EM label shift estimation (Lipton et al., ICML 2018).
         Assumes uniform source prior p_s(y) = 1/C (balanced training set).
         Returns importance weights w_t = p_t(y) / p_s(y), mean-normalised.
         """
-        C   = self.num_classes
+        C = self.num_classes
         p_s = torch.ones(C) / C
         p_t = torch.ones(C) / C
 
         for _ in range(max_iter):
             old = p_t.clone()
-            w   = p_t / p_s.clamp(min=1e-8)
-            rw  = probs * w.unsqueeze(0)
-            rw  = rw / rw.sum(1, keepdim=True).clamp(min=1e-8)
-            p_t = rw.mean(0)
+            w = p_t / p_s.clamp(min=1e-8)
+            rw = probs * w.unsqueeze(0)
+            rw = rw / rw.sum(1, keepdim=True).clamp(min=1e-8)
+            new = rw.mean(0)
+            p_t = 0.7 * p_t + 0.3 * new
+
             p_t = p_t / p_t.sum()
             if (p_t - old).abs().max() < tol:
                 break
@@ -199,7 +204,7 @@ class RobustClassifier(nn.Module):
                 for i in range(0, len(x_norm), 512):
                     chunk = x_norm[i:i + 512].to(device)
                     probs_list.append(
-                        F.softmax(self.backbone(chunk), dim=1).cpu())
+                        F.softmax(self.backbone(chunk) / 1.2, dim=1).cpu())
             probs = torch.cat(probs_list)
             w_t = self._em_estimate_w_t(probs)
             self._log_w_t = torch.log(w_t.clamp(min=1e-8)).to(device)
