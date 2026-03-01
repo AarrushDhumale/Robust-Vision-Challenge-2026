@@ -93,7 +93,8 @@ def main():
     patience = 7
     patience_counter = 0
 
-    print("Starting training...")
+    print("Avaneesh: GCE+simplified model_sub")
+    print("Starting Phase 1: Decontamination...")
 
     for epoch in range(epochs):
         model.train()
