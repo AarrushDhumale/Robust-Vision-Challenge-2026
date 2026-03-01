@@ -270,9 +270,7 @@ def forward(self, x):
 
 ---
 
-## Design Decisions & Compliance
-
-### Competition Compliance Checklist
+## Compliance
 
 | Requirement | Status |
 |---|---|
