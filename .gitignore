@@ -1,3 +1,4 @@
 /venv
 /data
-/weights.pth
+weights.pth
+/__pycache__
