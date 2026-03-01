@@ -226,13 +226,13 @@ def train(args):
             logits = model(imgs)
 
             # Warmup: CE on all samples; afterwards: GCE + small-loss filter
-            """
+
             per_sample = ce(logits, lbls) if epoch <= args.warmup \
                 else gce(logits, lbls)
 
             mask = small_loss_mask(per_sample.detach(), args.forget_rate,
                                    epoch, args.warmup)
-            
+
             """
             per_sample = ce(logits, lbls) if epoch <= args.warmup \
                 else gce(logits, lbls)
@@ -248,6 +248,7 @@ def train(args):
                                    current_forget,
                                    epoch,
                                    args.warmup)
+            """
 
             if mask.sum() == 0:
                 continue
@@ -314,6 +315,6 @@ if __name__ == '__main__':
     p.add_argument('--gce_q',       type=float, default=0.7)
     p.add_argument('--forget_rate', type=float, default=0.30)
     p.add_argument('--warmup',      type=int,   default=10)
-    p.add_argument('--patience',    type=int,   default=20)
+    p.add_argument('--patience',    type=int,   default=15)
     p.add_argument('--seed',        type=int,   default=42)
     train(p.parse_args())
