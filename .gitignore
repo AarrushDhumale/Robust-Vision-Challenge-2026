@@ -1,5 +1,9 @@
 /venv
 /data
 weights.pth
+<<<<<<< HEAD
 __pycache__/
 *.pyc
+=======
+/__pycache__
+>>>>>>> 3e7da89 (changed gitignore)
