@@ -113,7 +113,7 @@ def generate_submission(args):
 if __name__ == '__main__':
     p = argparse.ArgumentParser()
     p.add_argument('--weights', default='weights.pth')
-    p.add_argument('--static',  default='static.pt')
-    p.add_argument('--suite',   default='test_suite_public.pt')
+    p.add_argument('--static',  default='./data/hackenza-2026-test-time-adaptation-in-the-wild/static.pt')
+    p.add_argument('--suite',   default='./data/hackenza-2026-test-time-adaptation-in-the-wild/test_suite_public.pt')
     p.add_argument('--output',  default='submission.csv')
     generate_submission(p.parse_args())
