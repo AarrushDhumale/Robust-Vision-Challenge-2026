@@ -58,13 +58,17 @@ class RobustClassifier(nn.Module):
 
             for _ in range(10):
                 weighted = probs * (p_t / p_s)
-                weighted = weighted / \
-                    (weighted.sum(dim=1, keepdim=True) + 1e-8)
+                weighted = weighted / (
+                    weighted.sum(dim=1, keepdim=True) + 1e-8
+                )
 
                 new_estimate = weighted.mean(dim=0)
                 p_t = 0.8 * p_t + 0.2 * new_estimate
 
-        return logits
+                log_adjustment = torch.log(p_t + 1e-8) - torch.log(p_s + 1e-8)
+                logits = logits + log_adjustment
+
+            return logits
 
     def load_weights(self, path):
         self.load_state_dict(torch.load(path, map_location='cpu'))
