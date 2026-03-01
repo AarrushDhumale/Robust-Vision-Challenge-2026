@@ -1,105 +1,113 @@
+import os
+import random
+import numpy as np
 import torch
 import torch.nn as nn
-import torch.optim as optim
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader, TensorDataset
-import torchvision.transforms as T
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+import torchvision.transforms as transforms
 from model_submission import RobustClassifier
 
-# --- 1. Generalized Cross Entropy (GCE) Loss ---
-class GCELoss(nn.Module):
-    def __init__(self, q=0.7, num_classes=10):
+def set_seed(seed=42):
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+class RobustComboLoss(nn.Module):
+    def __init__(self, alpha=1.0, beta=1.0, q=0.7, num_classes=10):
         super().__init__()
+        self.alpha = alpha
+        self.beta = beta
         self.q = q
         self.num_classes = num_classes
 
     def forward(self, logits, targets):
-        probs = F.softmax(logits, dim=1)
-        targets_1hot = F.one_hot(targets, num_classes=self.num_classes)
-        p_y = torch.sum(probs * targets_1hot, dim=1)
-        # (1 - p^q) / q
-        loss = (1.0 - torch.pow(p_y + 1e-8, self.q)) / self.q
-        return loss.mean()
+        pred_probs = F.softmax(logits, dim=1)
+        
+        # 1. GCE Term
+        target_probs = torch.gather(pred_probs, 1, targets.view(-1, 1)).squeeze(1)
+        gce_loss = ((1.0 - (target_probs + 1e-8)) ** self.q).mean()
 
-# --- 2. Dataset Loader ---
-class ToxicDataset(Dataset):
-    def __init__(self, pt_path, transform=None):
-        data = torch.load(pt_path, map_location='cpu')
-        self.images = data['images']
-        self.labels = data['labels']
-        self.transform = transform
+        # 2. RCE Term (CORRECTED)
+        one_hot = F.one_hot(targets, num_classes=self.num_classes).float()
+        # Clamp the labels to avoid log(0) = -inf
+        targets_clamped = torch.clamp(one_hot, min=1e-4, max=1.0)
+        # RCE Math: sum( predicted_probs * log(clamped_targets) )
+        rce_loss = (-1 * (pred_probs * torch.log(targets_clamped)).sum(dim=1)).mean()
 
-    def __len__(self):
-        return len(self.labels)
+        return self.alpha * gce_loss + self.beta * rce_loss
 
-    def __getitem__(self, idx):
-        img = self.images[idx]
-        label = self.labels[idx]
-        if self.transform:
-            img = self.transform(img)
-        return img, label
+def load_pt_data(filepath):
+    data = torch.load(filepath, map_location='cpu')
+    images, labels = data['images'], data['labels']
+    if images.dtype == torch.uint8:
+        images = images.float() / 255.0
+    return TensorDataset(images, labels)
 
-def train():
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Training on device: {device}")
+def main():
+    set_seed(42)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # Strictly legal geometric augmentations
-    transform = T.Compose([
-        T.RandomCrop(28, padding=4, padding_mode='reflect'),
-        T.RandomHorizontalFlip(),
+    train_transform = transforms.Compose([
+        transforms.RandomCrop(28, padding=4),
+        transforms.RandomHorizontalFlip(),
     ])
-    
-    # Load Training Data (Toxic)
-    train_dataset = ToxicDataset('source_toxic.pt', transform=transform)
-    train_loader = DataLoader(train_dataset, batch_size=128, shuffle=True, num_workers=2, drop_last=True)
-    
-    # Load Validation Data (Clean Sanity Check)
-    val_data = torch.load('val_sanity.pt', map_location='cpu')
-    val_dataset = TensorDataset(val_data['images'], val_data['labels'])
-    val_loader = DataLoader(val_dataset, batch_size=100, shuffle=False)
-    
+
+    train_dataset = load_pt_data('./data/hackenza-2026-test-time-adaptation-in-the-wild/source_toxic.pt')
+    val_dataset = load_pt_data('./data/hackenza-2026-test-time-adaptation-in-the-wild/val_sanity.pt')
+
+    train_loader = DataLoader(train_dataset, batch_size=128, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=128, shuffle=False)
+
     model = RobustClassifier().to(device)
-    criterion = GCELoss(q=0.7)
-    optimizer = optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=40)
-    
+    optimizer = optim.Adam(model.parameters(), lr=5e-4, weight_decay=1e-4)
+
+    cce_loss_fn = nn.CrossEntropyLoss()
+    combo_loss_fn = RobustComboLoss(alpha=1.0, beta=1.0, q=0.7)
+
     epochs = 40
+    warmup_epochs = 2
     best_val_acc = 0.0
-    
-    print("Initiating Phase 1: Robust Training...")
+
+    print("Starting Phase 1: Decontamination...")
     for epoch in range(epochs):
-        # --- Training Loop ---
         model.train()
-        total_loss = 0
-        for imgs, labels in train_loader:
-            imgs, labels = imgs.to(device), labels.to(device)
-            
+        running_loss = 0.0
+        current_loss_fn = cce_loss_fn if epoch < warmup_epochs else combo_loss_fn
+
+        for images, labels in train_loader:
+            images, labels = images.to(device), labels.to(device)
+            augmented_images = torch.stack([train_transform(img) for img in images])
+
             optimizer.zero_grad()
-            logits = model(imgs)
-            loss = criterion(logits, labels)
+            logits = model(augmented_images)
+            loss = current_loss_fn(logits, labels)
+
             loss.backward()
             optimizer.step()
-            total_loss += loss.item()
-            
-        scheduler.step()
-        
-        # --- Validation Loop (The Audit) ---
+            running_loss += loss.item()
+
+        # Validation
         model.eval()
-        val_correct = 0
+        correct = 0
         with torch.no_grad():
-            for val_imgs, val_labels in val_loader:
-                val_imgs, val_labels = val_imgs.to(device), val_labels.to(device)
-                val_logits = model(val_imgs)
-                val_correct += (val_logits.argmax(1) == val_labels).sum().item()
-                
-        val_acc = val_correct / len(val_dataset)
-        print(f"Epoch {epoch+1:02d}/{epochs} | Train Loss: {total_loss/len(train_loader):.4f} | Val Sanity Acc: {val_acc:.4f}")
-        
-        # Checkpoint the best model based strictly on clean data
+            for images, labels in val_loader:
+                images, labels = images.to(device), labels.to(device)
+                logits = model(images)
+                correct += (logits.argmax(1) == labels).sum().item()
+
+        val_acc = 100 * correct / len(val_dataset)
+        print(f"Epoch {epoch+1:02d} | Loss: {running_loss/len(train_loader):.4f} | Val Acc: {val_acc:.2f}%")
+
         if val_acc >= best_val_acc:
             best_val_acc = val_acc
             torch.save(model.state_dict(), 'weights.pth')
-            print(f"  --> New best weights saved! (Sanity Acc: {best_val_acc:.4f})")
 
 if __name__ == '__main__':
-    train()
+    main()
