@@ -1,80 +1,95 @@
 import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
 import pandas as pd
+from torch.utils.data import TensorDataset, DataLoader
 from model_submission import RobustClassifier
-import time
 
-def generate_submission(model, static_path, suite_path, device):
+def setup_tent(model):
+    """Forces BN to use target batch stats and enables gradients only on BN parameters."""
+    model.train()
+    model.requires_grad_(False)
+    
+    params = []
+    for m in model.modules():
+        if isinstance(m, nn.BatchNorm2d):
+            m.requires_grad_(True)
+            m.weight.requires_grad = True
+            m.bias.requires_grad = True
+            params.extend([m.weight, m.bias])
+            
+    return optim.Adam(params, lr=1e-3)
+
+def adapt_and_predict(model, images_tensor, device, steps=2):
+    """Executes Covariate Alignment (TENT) and Label Shift Estimation (EM)."""
+    dataset = TensorDataset(images_tensor)
+    loader = DataLoader(dataset, batch_size=128, shuffle=False)
+    
+    optimizer = setup_tent(model)
+    target_prior = torch.ones(10, device=device) / 10.0 # Initialize uniform prior
+    
+    for step in range(steps):
+        all_preds = []
+        for batch in loader:
+            imgs = batch[0].to(device)
+            logits = model(imgs)
+            
+            # EM Step: Adjust logits based on estimated target prior
+            adjusted_logits = logits + torch.log(target_prior + 1e-6) - torch.log(torch.tensor(0.1, device=device))
+            probs = F.softmax(adjusted_logits, dim=1)
+            
+            # Update running prior (Moving Average)
+            batch_prior = probs.mean(dim=0)
+            target_prior = 0.9 * target_prior + 0.1 * batch_prior.detach()
+            
+            # TENT Step: Entropy Minimization
+            entropy_loss = -torch.sum(probs * torch.log(probs + 1e-8), dim=1).mean()
+            optimizer.zero_grad()
+            entropy_loss.backward()
+            optimizer.step()
+            
+            if step == steps - 1:
+                all_preds.append(probs.argmax(dim=1).cpu())
+                
+    return torch.cat(all_preds)
+
+def main(model_path, static_path, suite_path):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     results = []
     
-    # ==========================================
-    # MISSION 1: SURVIVE STATIC.PT (Public LB)
-    # ==========================================
-    print("\n[Phase A] Deploying to target domain: static.pt")
-    start_time = time.time()
+    # --- PHASE 2: Public Leaderboard (Static Shift) ---
+    print("Evaluating Static Set (Public LB)...")
+    model = RobustClassifier().to(device)
+    model.load_weights(model_path)
     
-    static_data = torch.load(static_path)
-    # Extract images, shape is [B, 1, 28, 28]
-    static_images = static_data['images'].to(device)
+    static_data = torch.load(static_path, map_location='cpu')
+    static_preds = adapt_and_predict(model, static_data['images'], device)
     
-    with torch.no_grad():
-        # The model's forward pass triggers BNStats and EM automatically
-        preds = model(static_images).argmax(1).cpu()
+    for i, p in enumerate(static_preds):
+        results.append({'ID': f'static_{i}', 'Category': int(p)})
         
-        # --- HEALTH CHECK ---
-        unique, counts = torch.unique(preds, return_counts=True)
-        distribution = dict(zip(unique.numpy(), counts.numpy()))
-        print(f" -> Predicted Distribution: {distribution}")
+    # --- PHASE 3: Private Leaderboard (The 24 Scenarios) ---
+    print("\nEvaluating 24-Scenario Suite (Private LB)...")
+    suite = torch.load(suite_path, map_location='cpu')
+    scenario_keys = sorted([k for k in suite.keys() if k.startswith('scenario')])
+    
+    for skey in scenario_keys:
+        print(f"  -> Adapting to {skey}...")
+        # CRITICAL HARD RESET: Reload pristine weights to prevent catastrophic forgetting
+        model = RobustClassifier().to(device)
+        model.load_weights(model_path)
+        
+        scenario_images = suite[skey]
+        preds = adapt_and_predict(model, scenario_images, device)
         
         for i, p in enumerate(preds):
-            results.append({'ID': f'static_{i}', 'Category': int(p)})
-            
-    print(f" -> static.pt complete in {time.time() - start_time:.2f}s")
+            results.append({'ID': f'{skey}_{i}', 'Category': int(p)})
 
-    # ==========================================
-    # MISSION 2: SURVIVE THE TEST SUITE (Private LB Prep)
-    # ==========================================
-    print("\n[Phase B] Deploying to Hidden Matrix (24 Scenarios)...")
-    suite = torch.load(suite_path)
-    scenario_keys = sorted([k for k in suite.keys() if k.startswith('scenario')])
-
-    for skey in scenario_keys:
-        print(f" Adapting to {skey}...")
-        scenario_images = suite[skey].to(device)
-        
-        with torch.no_grad():
-            # Because of your memory reset in model_submission.py, 
-            # the model starts completely fresh for every new scenario.
-            preds = model(scenario_images).argmax(1).cpu()
-            
-            # --- HEALTH CHECK ---
-            unique, counts = torch.unique(preds, return_counts=True)
-            distribution = dict(zip(unique.numpy(), counts.numpy()))
-            # Just print the number of unique classes predicted to ensure no Mode Collapse
-            print(f"    Unique Classes Predicted: {len(unique)}/10")
-            
-            for i, p in enumerate(preds):
-                results.append({'ID': f'{skey}_{i}', 'Category': int(p)})
-
-    # ==========================================
-    # MISSION 3: COMPILE CSV
-    # ==========================================
-    print("\n[Phase C] Writing submission.csv...")
+    # Save to CSV
     pd.DataFrame(results).to_csv('submission.csv', index=False)
-    print("Done! Ready for Kaggle upload.")
+    print("\n[SUCCESS] submission.csv generated and correctly formatted!")
 
 if __name__ == '__main__':
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Initializing Deployment on {device}...")
-    
-    # Load the base weights from Phase 1 Bootcamp
-    model = RobustClassifier()
-    model.load_weights('weights.pth')
-    model = model.to(device)
-    # Crucial: the main model stays in eval, but your forward pass selectively overrides BN layers
-    model.eval() 
-    
-    # Verify these paths match your local directory structure
-    static_pt = './data/hackenza-2026-test-time-adaptation-in-the-wild/static.pt'
-    suite_pt = './data/hackenza-2026-test-time-adaptation-in-the-wild/test_suite_public.pt'
-    
-    generate_submission(model, static_pt, suite_pt, device)
+    # Ensure source_toxic.pt, static.pt, val_sanity.pt, and test_suite_public.pt are in the directory
+    main('weights.pth', 'static.pt', 'test_suite_public.pt')
