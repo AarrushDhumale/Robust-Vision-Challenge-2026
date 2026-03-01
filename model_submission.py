@@ -40,7 +40,7 @@ class RobustClassifier(nn.Module):
         for module in self.modules():
             if isinstance(module, nn.BatchNorm2d):
                 original_momentums[module] = module.momentum
-                module.momentum = 0.5  # Balanced adaptation
+                module.momentum = 0.2  # Balanced adaptation
 
         # Single recalibration pass
         self.train()
@@ -72,7 +72,7 @@ class RobustClassifier(nn.Module):
         # ----------------------------------------------------------
         # 1. Covariate Shift Adaptation (BNStats - controlled)
         # ----------------------------------------------------------
-        if not self.training and n >= 32:
+        if not self.training and n >= 64:
             self._bn_recalibration(x)
 
         # ----------------------------------------------------------

@@ -22,7 +22,7 @@ def set_seed(seed=42):
 
 
 # ==========================================================
-# PURE GENERALIZED CROSS ENTROPY (GCE)
+# PURE GENERALIZED CROSS ENTROPY (Correct Formula)
 # ==========================================================
 class GCELoss(nn.Module):
     def __init__(self, q=0.7):
@@ -31,7 +31,11 @@ class GCELoss(nn.Module):
 
     def forward(self, logits, targets):
         probs = F.softmax(logits, dim=1)
-        p_true = torch.gather(probs, 1, targets.view(-1, 1)).squeeze(1)
+
+        p_true = torch.gather(
+            probs, 1, targets.view(-1, 1)
+        ).squeeze(1)
+
         p_true = torch.clamp(p_true, 1e-7, 1.0)
 
         if self.q == 0:
@@ -44,9 +48,10 @@ class GCELoss(nn.Module):
 
 def load_pt_data(filepath):
     if not os.path.exists(filepath):
-        raise FileNotFoundError(f"Missing dataset: {filepath}")
+        raise FileNotFoundError(f"Missing required dataset: {filepath}")
 
     data = torch.load(filepath)
+
     if isinstance(data, dict):
         images, labels = data['images'], data['labels']
     else:
@@ -62,9 +67,8 @@ def main():
     set_seed(42)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Training on {device}")
+    print(f"Training on device: {device}")
 
-    # Whitelisted augmentations only
     train_transform = transforms.Compose([
         transforms.RandomCrop(28, padding=4),
         transforms.RandomHorizontalFlip(),
@@ -72,20 +76,21 @@ def main():
 
     print("Loading datasets...")
     train_dataset = load_pt_data(
-        './data/hackenza-2026-test-time-adaptation-in-the-wild/source_toxic.pt')
+        './data/hackenza-2026-test-time-adaptation-in-the-wild/source_toxic.pt'
+    )
     val_dataset = load_pt_data(
-        './data/hackenza-2026-test-time-adaptation-in-the-wild/val_sanity.pt')
+        './data/hackenza-2026-test-time-adaptation-in-the-wild/val_sanity.pt'
+    )
 
     train_loader = DataLoader(train_dataset, batch_size=128, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=128, shuffle=False)
 
     model = RobustClassifier().to(device)
 
-    # Slightly lower LR for stability under noise
     optimizer = optim.Adam(model.parameters(), lr=3e-4, weight_decay=1e-4)
 
-    ce_loss = nn.CrossEntropyLoss()
-    gce_loss = GCELoss(q=0.7)
+    ce_loss_fn = nn.CrossEntropyLoss()
+    gce_loss_fn = GCELoss(q=0.7)
 
     epochs = 50
     warmup_epochs = 5
@@ -98,36 +103,60 @@ def main():
 
     for epoch in range(epochs):
         model.train()
-        running_loss = 0.0
 
-        current_loss = ce_loss if epoch < warmup_epochs else gce_loss
+        running_loss = 0.0
+        correct_train = 0
+        total_train = 0
+        confidence_sum = 0.0
+
+        current_loss_fn = ce_loss_fn if epoch < warmup_epochs else gce_loss_fn
 
         for images, labels in train_loader:
-            images = torch.stack([train_transform(img) for img in images])
-            images, labels = images.to(device), labels.to(device)
+            augmented_images = torch.stack(
+                [train_transform(img) for img in images]
+            )
+
+            augmented_images = augmented_images.to(device)
+            labels = labels.to(device)
 
             optimizer.zero_grad()
-            logits = model(images)
-            loss = current_loss(logits, labels)
+
+            logits = model(augmented_images)
+            loss = current_loss_fn(logits, labels)
 
             loss.backward()
-
-            # Gradient clipping for extra stability
             torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-
             optimizer.step()
+
             running_loss += loss.item()
 
+            # --------- Metrics ----------
+            probs = F.softmax(logits, dim=1)
+            preds = torch.argmax(probs, dim=1)
+
+            correct_train += (preds == labels).sum().item()
+            total_train += labels.size(0)
+
+            confidence_sum += probs.max(dim=1)[0].sum().item()
+
+        train_acc = 100 * correct_train / total_train
+        avg_conf = confidence_sum / total_train
+
+        # ----------------------------
         # Validation
+        # ----------------------------
         model.eval()
         correct = 0
         total = 0
 
         with torch.no_grad():
             for images, labels in val_loader:
-                images, labels = images.to(device), labels.to(device)
+                images = images.to(device)
+                labels = labels.to(device)
+
                 logits = model(images)
                 preds = torch.argmax(logits, dim=1)
+
                 total += labels.size(0)
                 correct += (preds == labels).sum().item()
 
@@ -135,11 +164,12 @@ def main():
 
         print(
             f"Epoch {epoch+1}/{epochs} | "
-            f"Loss: {running_loss/len(train_loader):.4f} | "
+            f"Train Loss: {running_loss/len(train_loader):.4f} | "
+            f"Train Acc: {train_acc:.2f}% | "
+            f"Train Conf: {avg_conf:.3f} | "
             f"Val Acc: {val_acc:.2f}%"
         )
 
-        # Early stopping
         if val_acc > best_val_acc:
             best_val_acc = val_acc
             torch.save(model.state_dict(), 'weights.pth')
