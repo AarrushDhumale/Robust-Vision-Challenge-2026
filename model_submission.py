@@ -1,4 +1,3 @@
-import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -9,12 +8,12 @@ class RobustClassifier(nn.Module):
     def __init__(self):
         super().__init__()
 
-        # ==========================================================
-        # Backbone (Random Init Only)
-        # ==========================================================
+        # ----------------------------------------------------------
+        # Backbone (random init only)
+        # ----------------------------------------------------------
         self.backbone = resnet18(weights=None)
 
-        # Modify for 1-channel input
+        # Modify for 1-channel 28x28 input
         self.backbone.conv1 = nn.Conv2d(
             1, 64, kernel_size=3, stride=1, padding=1, bias=False
         )
@@ -23,22 +22,35 @@ class RobustClassifier(nn.Module):
         num_ftrs = self.backbone.fc.in_features
         self.backbone.fc = nn.Linear(num_ftrs, 10)
 
-        # For scenario isolation
-        self.pristine_state = None
+        # Store pristine BN buffers for scenario reset
+        self.pristine_buffers = None
 
     # ==========================================================
-    # Controlled BN Recalibration (Single Pass)
+    # Controlled BN Recalibration (Single Pass, momentum=0.5)
     # ==========================================================
     def _bn_recalibration(self, x):
         """
-        Perform a single forward pass with BN in train mode
-        to update running statistics using target batch.
-        No gradients, no weight updates.
+        Perform one forward pass in train() mode to update
+        BatchNorm running stats using target data.
+        Temporarily set momentum=0.5 for balanced adaptation.
         """
+
+        # Save original momentums
+        original_momentums = {}
+        for module in self.modules():
+            if isinstance(module, nn.BatchNorm2d):
+                original_momentums[module] = module.momentum
+                module.momentum = 0.5  # Balanced adaptation
+
+        # Single recalibration pass
         self.train()
         with torch.no_grad():
             _ = self.backbone(x)
         self.eval()
+
+        # Restore original momentum values
+        for module, momentum in original_momentums.items():
+            module.momentum = momentum
 
     # ==========================================================
     # Forward
@@ -48,31 +60,34 @@ class RobustClassifier(nn.Module):
         n = x.size(0)
 
         # ----------------------------------------------------------
-        # 0. Scenario Isolation (Reset BN buffers)
+        # 0. Scenario Isolation (Reset BN buffers only)
         # ----------------------------------------------------------
-        if not self.training and self.pristine_state is not None:
+        if not self.training and self.pristine_buffers is not None:
             for name, buffer in self.named_buffers():
-                if name in self.pristine_state:
-                    buffer.data.copy_(self.pristine_state[name].to(device))
+                if name in self.pristine_buffers:
+                    buffer.data.copy_(
+                        self.pristine_buffers[name].to(device)
+                    )
 
         # ----------------------------------------------------------
-        # 1. Controlled Covariate Shift Adaptation (BNStats)
+        # 1. Covariate Shift Adaptation (BNStats - controlled)
         # ----------------------------------------------------------
         if not self.training and n >= 32:
             self._bn_recalibration(x)
 
         # ----------------------------------------------------------
-        # 2. Logit Extraction (OOM Safe)
+        # 2. Stable Logit Extraction (OOM-safe)
         # ----------------------------------------------------------
         if self.training:
             logits = self.backbone(x)
         else:
             batch_size = 256
-            chunks = []
+            outputs = []
             with torch.no_grad():
                 for i in range(0, n, batch_size):
-                    chunks.append(self.backbone(x[i:i+batch_size]))
-            logits = torch.cat(chunks, dim=0)
+                    chunk = x[i:i+batch_size]
+                    outputs.append(self.backbone(chunk))
+            logits = torch.cat(outputs, dim=0)
 
         # ----------------------------------------------------------
         # 3. Label Shift Correction (EM)
@@ -84,14 +99,15 @@ class RobustClassifier(nn.Module):
             p_s = torch.ones(num_classes, device=device) / num_classes
             p_t = p_s.clone()
 
-            # Temperature smoothing for stability
+            # Temperature smoothing improves EM stability
             probs = F.softmax(logits / 1.5, dim=1)
 
             # EM iterations
             for _ in range(10):
                 weighted = probs * (p_t / p_s)
-                weighted = weighted / \
-                    (weighted.sum(dim=1, keepdim=True) + 1e-8)
+                weighted = weighted / (
+                    weighted.sum(dim=1, keepdim=True) + 1e-8
+                )
                 p_t = weighted.mean(dim=0)
 
             # Logit prior correction
@@ -101,12 +117,13 @@ class RobustClassifier(nn.Module):
         return logits
 
     # ==========================================================
-    # Weight Loading
+    # Load Weights
     # ==========================================================
     def load_weights(self, path):
-        self.load_state_dict(torch.load(path, map_location='cpu'))
+        self.load_state_dict(torch.load(path, map_location="cpu"))
 
-        # Save pristine BN buffers for reset
-        self.pristine_state = {
-            n: b.clone() for n, b in self.named_buffers()
+        # Save clean BN buffers for scenario resets
+        self.pristine_buffers = {
+            name: buffer.clone()
+            for name, buffer in self.named_buffers()
         }
